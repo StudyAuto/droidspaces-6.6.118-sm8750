@@ -1,57 +1,74 @@
-// 探针：读出设备内核真实的 module_layout CRC。
+// 探针：把设备内核的**完整导出符号表 + CRC** 导出成 Module.symvers。
 //
-// 背景：模块加载时内核只对 module_layout 做强校验
-//   "disagrees about version of symbol module_layout"
-// 设备内核的 CRC 表在内存里，但没有 /proc/kcore，kallsyms 也只给出
-// module_layout 的函数地址而非 CRC。用户态拿不到，只能让内核代码读。
+// 为什么不再尝试"复现内核构建环境"：
+//   设备内核 6.6.118-android15-8-g899dc6830d9c 是第三方基于官方源码编译的，
+//   带 KSU/SUSFS/厂商补丁；公开仓库里没有这个 commit，也复现不出同样的
+//   struct 布局。实测 module_layout CRC：
+//       设备   0x4e276f37
+//       我们   0x6500052f   ← 完全不同
+//   所以无论怎么调 CONFIG 都编不出能加载的模块。
 //
-// 为什么用模块参数传地址：
-//   kallsyms_lookup_name 在新内核不导出（modpost 会报 undefined），
-//   __crc_module_layout 也不是导出符号。但用户态能以 root 读
-//   /proc/kallsyms（kptr_restrict=0 时拿得到真实地址），
-//   把 __start___ksymtab / __start___kcrctab 的基址作为参数传进来即可。
-//   探针只依赖已导出的 copy_from_kernel_nofault。
+// 正解：设备内核自己的 __kcrctab 就是权威来源。
+//   把 __ksymtab（名字/命名空间）与 __kcrctab（CRC，顺序一一对应）读出来，
+//   生成一份完全匹配设备的 Module.symvers，再用它编译模块。
+//   这样每个导入符号的 CRC 都与设备一致，__versions 校验自然通过。
 //
 // 原理：CONFIG_HAVE_ARCH_PREL32_RELOCATIONS 下
 //   struct kernel_symbol { s32 value_offset; s32 name_offset; s32 namespace_offset; }
-// 12 字节，按导出顺序排在 __ksymtab；__kcrctab 每项 4 字节，顺序一一对应。
-// 找到名为 module_layout 的下标 i，__kcrctab[i] 就是它的 CRC。
+//   12 字节；__kcrctab 每项 4 字节，顺序对应。
 //
-// 安全：只读内核数据段，不引用任何内核结构体、不改任何状态。
-// 即使配置不匹配也不会 panic（区别于 droid_lkm_misc 那种操作结构体的模块）。
+// 安全：只读内核数据段，不引用任何内核结构体、不改状态。
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/uaccess.h>
 #include <linux/string.h>
+#include <linux/fs.h>
+#include <linux/file.h>
+#include <linux/version.h>
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("read the running kernel module_layout CRC");
+MODULE_DESCRIPTION("export the running kernel export table as Module.symvers");
 
 static unsigned long ksymtab_base;
 static unsigned long kcrctab_base;
+static unsigned long ksymtab_end;
+static char *out_path = "/data/local/tmp/device.symvers";
 module_param(ksymtab_base, ulong, 0444);
 module_param(kcrctab_base, ulong, 0444);
-MODULE_PARM_DESC(ksymtab_base, "__start___ksymtab from /proc/kallsyms");
-MODULE_PARM_DESC(kcrctab_base, "__start___kcrctab from /proc/kallsyms");
+module_param(ksymtab_end, ulong, 0444);
+module_param(out_path, charp, 0444);
 
 #define KSYM_ENTRY 12
 #define MAX_SCAN   8192
 
 static int __init crcprobe_init(void)
 {
-	int i, found = -1;
+	struct file *f;
+	loff_t pos = 0;
+	int i, written = 0;
 
-	if (!ksymtab_base || !kcrctab_base) {
-		pr_info("CRCPROBE: missing params ksymtab_base/kcrctab_base\n");
+	if (!ksymtab_base || !kcrctab_base || !ksymtab_end) {
+		pr_info("CRCPROBE: missing section bases\n");
 		return -EINVAL;
 	}
-	pr_info("CRCPROBE: ksymtab=0x%lx kcrctab=0x%lx\n", ksymtab_base, kcrctab_base);
+
+	f = filp_open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (IS_ERR(f)) {
+		pr_info("CRCPROBE: open %s failed %ld\n", out_path, PTR_ERR(f));
+		return -EINVAL;
+	}
 
 	for (i = 0; i < MAX_SCAN; i++) {
-		s32 name_off = 0;
 		unsigned long entry = ksymtab_base + (unsigned long)i * KSYM_ENTRY;
+		s32 name_off = 0;
 		unsigned long name_addr;
-		char name[32];
+		char name[128];
+		u32 crc = 0;
+		char line[196];
+		int len;
+
+		if (entry + KSYM_ENTRY > ksymtab_end)
+			break;
 
 		memset(name, 0, sizeof(name));
 		if (copy_from_kernel_nofault(&name_off, (void *)(entry + 4), sizeof(name_off)))
@@ -59,26 +76,22 @@ static int __init crcprobe_init(void)
 		name_addr = entry + 4 + (long)name_off;
 		if (copy_from_kernel_nofault(name, (void *)name_addr, sizeof(name) - 1))
 			continue;
-		if (!memcmp(name, "module_layout", 13)) {
-			found = i;
-			break;
-		}
+		if (!name[0])
+			continue;
+
+		if (copy_from_kernel_nofault(&crc, (void *)(kcrctab_base + (unsigned long)i * 4),
+					     sizeof(crc)))
+			continue;
+
+		// Module.symvers 格式：CRC \t 名字 \t 模块 \t 导出类型
+		len = scnprintf(line, sizeof(line), "0x%08x\t%s\tvmlinux\tEXPORT_SYMBOL\n",
+				crc, name);
+		if (kernel_write(f, line, len, &pos) == len)
+			written++;
 	}
 
-	if (found < 0) {
-		pr_info("CRCPROBE: module_layout not found in ksymtab\n");
-		return -EINVAL;
-	}
-
-	{
-		u32 crc = 0;
-		unsigned long crc_addr = kcrctab_base + (unsigned long)found * 4;
-		if (copy_from_kernel_nofault(&crc, (void *)crc_addr, sizeof(crc)))
-			pr_info("CRCPROBE: read crc failed at 0x%lx\n", crc_addr);
-		else
-			pr_info("CRCPROBE: index=%d module_layout_crc=0x%08x\n", found, crc);
-	}
-
+	filp_close(f, NULL);
+	pr_info("CRCPROBE: wrote %d symbols to %s\n", written, out_path);
 	return -EINVAL;
 }
 
