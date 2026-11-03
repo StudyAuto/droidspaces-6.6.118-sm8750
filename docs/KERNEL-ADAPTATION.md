@@ -274,6 +274,51 @@ python3 .github/scripts/check-symvers.py .github/symvers/device-*.symvers foo.ko
 > 教训：**「指针」和「函数入口」的对齐要求不是一回事。**
 > 凡是拿 `sizeof(void *)` 当对齐单位去校验函数地址，在 arm64 上都是错的。
 
+**修复后实测**（2026-11-04，真机）：
+
+```text
+修复前 dmesg:  mntns_operations unusable: -22
+               userns unavailable: -22
+修复前 status: userns  unsupported  owner symbols missing
+
+修复后 dmesg:  userns hooks installed
+               userns map selftest passed
+               userns view: 18 armed, 0 unavailable, real=0
+               userns ready
+修复后 status: userns  ready  unshare clone namespace entry credential swap
+```
+
+### 8.1 别把 selftest 的 `-22` 误判成同一个 bug
+
+修好对齐后 `status` 里可能仍看到：
+
+```text
+userns selftest   failed   1 failed: unshare(CLONE_NEWUSER) (-22)
+```
+
+**这是策略默认值，不是故障。** 自检会在初始化时用进程名
+`dlm_userns_prob` 试一次 `unshare(CLONE_NEWUSER)`，而 `userns_any`
+默认为 0（只服务「已在 namespace 内」或「从 root 启动」的任务），
+自检进程两者都不满足。dmesg 会明确写：
+
+```text
+unshare: dlm_userns_prob refused, userns_any is off
+```
+
+想跑通完整自检：`insmod droid_lkm_misc.ko userns_any=1`。
+
+> ⚠️ `droid_lkm` 被 proc ns hook 永久 pin（`ds_proc.c:308` 的
+> `try_module_get`），改参数只能重启后重新加载。
+> 这不是 bug，是防止模块卸载后 hook 变成野指针的安全约束。
+
+**判断「userns 到底好不好」只看这一行**：
+
+```sh
+adb shell 'cat /proc/droid_lkm_misc/status | grep "^userns "'
+# 期望：userns  ready  unshare clone namespace entry credential swap
+# 若是：userns  unsupported  owner symbols missing  → 还是坏的
+```
+
 ---
 
 ## 9. 不要在设备上跑探针导出符号表

@@ -269,21 +269,51 @@ lkm 最后 —— 容器在跑时 lkm 会 `Try again`，需要先停容器）。
 | 逐符号 CRC 比对 | ✅ 645/645 与设备一致 |
 | `insmod` 6 个 | ✅ 全部 rc=0 |
 | 布局自校验 | ✅ 60+ 项 `live == build` |
-| hook | ✅ 6 个全部 `installed` |
-| userns | ⚠️ 见下 |
+| userns 初始化 | ✅ `userns ready`（修复前是 `unsupported`） |
+| userns view | ✅ `armed 18 armed 0 missing real=0` |
+| userns selftest | ⚠️ `unshare(CLONE_NEWUSER) -22`（策略默认值，见下） |
 
-关键修复：CI 装 `pahole` 后 `CONFIG_DEBUG_INFO_BTF_MODULES` 不再被
+关键修复一：CI 装 `pahole` 后 `CONFIG_DEBUG_INFO_BTF_MODULES` 不再被
 `olddefconfig` 静默关闭，`module_layout` CRC 从 `0x6500052f` 自动变成设备要的
 `0x4e276f37`，**全部导入符号自动对齐，无需手改任何一个**。
 
-userns 此前报 `-EINVAL`，根因**不是**「内核未编译」，
+关键修复二：userns 此前报 `-EINVAL`，根因**不是**「内核未编译」，
 而是 `is_text()` 拿 8 字节对齐去校验 4 字节对齐的 arm64 函数入口
 （`mntns_owner=...f53c`）。已在 `userns_owner.c` 修正为按指令宽度判，
 详见 [KERNEL-ADAPTATION.md §8](KERNEL-ADAPTATION.md)。
 
+上机实测的修复前后对比：
+
+```text
+修复前 dmesg:  mntns_operations unusable: -22
+               userns unavailable: -22
+修复前 status: userns  unsupported  owner symbols missing
+
+修复后 dmesg:  userns hooks installed
+               userns map selftest passed
+               userns view: 18 armed, 0 unavailable, real=0
+               userns ready
+修复后 status: userns  ready  unshare clone namespace entry credential swap
+```
+
 > `CONFIG_USER_NS is not set` 仍然成立——模块的 fake userns 本来就是用来
 > 替代内核功能的。修好对齐后 `mntns_operations` 能正常解析，
 > 这条路径才真正可用。
+
+**关于 selftest 的 `-22`**：这是**策略默认值**导致的，不是故障。
+模块自检会在初始化时用进程名 `dlm_userns_prob` 试一次
+`unshare(CLONE_NEWUSER)`，而 `userns_any` 默认为 0（只服务「已在
+namespace 内」或「从 root 启动」的任务），自检进程两者都不满足，
+于是被拒。dmesg 会明确写出 `refused, userns_any is off`。
+
+想跑通完整自检，需带 `userns_any=1` 加载：
+
+```sh
+insmod droid_lkm_misc.ko userns_any=1
+```
+
+> 但 `droid_lkm` 被 proc ns hook 永久 pin（`ds_proc.c:308` 的
+> `try_module_get`），要改参数只能重启后重新加载。
 
 ### 2026-11-03（本地 DDK）
 
