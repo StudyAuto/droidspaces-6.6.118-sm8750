@@ -90,7 +90,10 @@ jobs:
           # 设备配置取自 /proc/config.gz（7784 行，含 CONFIG_LOCALVERSION="-4k"、
           # MODULE_SIG_ALL、CFI_CLANG 等厂商定制项）。
           mkdir -p out
-          cp "$GITHUB_WORKSPACE/.github/kconfig/device-6.6.118.config" out/.config
+          # ⚠️ 必须去掉 CRLF！配置是从 adb shell 拉回来的，带 \r。
+          # 带 \r 时 CONFIG_LOCALVERSION="-4k\r"、所有字符串配置都多一个字符，
+          # 编译产物与设备不一致（也会让 .config 解析异常）。
+          tr -d '\r' < "$GITHUB_WORKSPACE/.github/kconfig/device-6.6.118.config" > out/.config
           make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
             CROSS_COMPILE=aarch64-linux-gnu- O=out olddefconfig
 
@@ -144,8 +147,10 @@ jobs:
           # 依赖项。这里把最终 .config 与我们提供的比一遍，漂移一目了然。
           echo "--- 配置漂移（设备配置 → 实际使用）---"
           DIFF_OUT=/tmp/cfgdiff.txt
-          diff <(sort "$GITHUB_WORKSPACE/.github/kconfig/device-6.6.118.config") \
-               <(sort out/.config) > "$DIFF_OUT" || true
+          # 过滤空行与纯注释行，只比 CONFIG_ 行；否则 sort 后空行错位，
+          # diff 会输出"整文件删除+整文件新增"的假漂移（上一轮 15534 行就是这么来的）
+          diff <(grep -E '^CONFIG_|^# CONFIG_' "$GITHUB_WORKSPACE/.github/kconfig/device-6.6.118.config" | sort) \
+               <(grep -E '^CONFIG_|^# CONFIG_' out/.config | sort) > "$DIFF_OUT" || true
           echo "漂移行数: $(wc -l < "$DIFF_OUT")"
           echo "--- 前 60 行漂移 ---"
           head -60 "$DIFF_OUT"
