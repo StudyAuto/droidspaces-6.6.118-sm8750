@@ -142,12 +142,19 @@ jobs:
           set -e
           export PATH="$CLANG_BIN:/usr/bin:/bin"
           KDIR="$GITHUB_WORKSPACE/kw/ksrc/out"
+          # 这两个模块用 $(src) 变量，必须在源码目录里编。
+          # 不再用 || true 吞错误 —— 上一轮它们静默失败，产物根本没生成。
+          echo "=== net_macvlan ==="
           cd "$GITHUB_WORKSPACE/src/net_macvlan"
           make KDIR="$KDIR" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-            CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" || true
+            CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)"
+          ls -la macvlan.ko
+
+          echo "=== net_ip6nat ==="
           cd "$GITHUB_WORKSPACE/src/net_ip6nat"
           make KDIR="$KDIR" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-            CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" || true
+            CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)"
+          ls -la ip6table_nat.ko
 
       - name: 校验产物（vermagic + __versions 必须非空）
         run: |
