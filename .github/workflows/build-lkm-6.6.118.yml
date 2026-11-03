@@ -39,10 +39,20 @@ jobs:
 
       - name: 安装依赖
         run: |
+          # ⚠️ pahole 不能省。
+          # 设备内核开了 CONFIG_DEBUG_INFO_BTF_MODULES=y，struct module 里因此
+          # 有 btf_data / btf_data_size 两个字段。没有 pahole 时 olddefconfig
+          # 会把这两项静默关掉（它们是依赖项，不是直接写的配置），导致
+          # struct module 布局位移 48 字节 → module_layout CRC 与设备不同 →
+          # 所有模块 insmod 都报 "disagrees about version of symbol module_layout"。
+          # 设备配置记的是 CONFIG_PAHOLE_VERSION=125，Ubuntu 24.04 自带的
+          # pahole 正好是 1.25，与设备编内核时用的版本一致。
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             bc bison flex libssl-dev libelf-dev python3 zip unzip aria2 \
-            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu rsync
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu rsync \
+            pahole zstd
+          pahole --version
 
       - name: 拉取 6.6.118 内核源码
         run: |
@@ -105,6 +115,19 @@ jobs:
           done
           grep -q '^CONFIG_LOCALVERSION="-4k"' out/.config && echo "  ✓ LOCALVERSION=-4k" || echo "  ! LOCALVERSION 不是 -4k"
 
+          # ⚠️ BTF 必须真的开着 —— 这是 module_layout CRC 能否匹配的关键。
+          # 设备内核 CONFIG_DEBUG_INFO_BTF_MODULES=y，struct module 里有
+          # btf_data / btf_data_size。少了这两个字段，struct module 尺寸不变
+          # （靠后面的 android_kabi_reserved 补位），但中间字段整体位移 48 字节，
+          # genksyms 算出的 module_layout CRC 就是错的。
+          # 这两项是 DEBUG_INFO_BTF 的依赖项，缺 pahole 时会被静默关掉，
+          # 所以必须在 olddefconfig 之后**硬断言**，不能只看输入配置。
+          for k in CONFIG_DEBUG_INFO_BTF CONFIG_DEBUG_INFO_BTF_MODULES; do
+            grep -q "^$k=y" out/.config \
+              && echo "  ✓ $k=y" \
+              || { echo "  ✗ $k 被 olddefconfig 关掉了（多半是缺 pahole）"; exit 1; }
+          done
+
           # 关 TRIM（理由见下）。同时删掉它依赖的空白名单文件，避免残留。
           ./scripts/config --file out/.config -d TRIM_UNUSED_KSYMS
           make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
@@ -133,8 +156,41 @@ jobs:
           # ===== 关键诊断：module_layout 的 CRC =====
           # 这是内核加载模块时唯一强校验的符号，代表 struct module 的布局。
           # 把它的 CRC 打出来，与设备期望值比对即可判断配置是否真的匹配。
-          echo "--- module_layout CRC（决定能否加载）---"
+          echo "--- module_layout CRC（本地产物）---"
           grep -w module_layout out/Module.symvers || echo "  (Module.symvers 里没有 module_layout!)"
+          echo "--- module_layout CRC（设备权威值，应为 0x4e276f37）---"
+          grep -w module_layout "$GITHUB_WORKSPACE/.github/symvers/device-6.6.118.symvers" \
+            || { echo "  ✗ 设备符号表缺失"; exit 1; }
+
+          # ===== 用设备权威 CRC 覆盖本地值 =====
+          # 为什么必须覆盖，而不是「把配置调到一致就行」：
+          #   设备内核是第三方基于官方源码的 fork（commit 899dc6830d9c
+          #   不在 cctv18 仓库里），头文件声明文本有漂移。而
+          #   CONFIG_MODVERSIONS 的 CRC 由 genksyms 按**声明文本**算出，
+          #   所以即便配置完全一致，本地也复现不出设备的真值。
+          #   实测：645 个导入符号里 265 个不同，且共同结构体里
+          #   双方都有 size 的 0 个不符 —— 是文本漂移，不是 ABI 差异。
+          #
+          # 安全性依据（已实测，不是推测）：
+          #   把设备 BTF(/sys/kernel/btf/vmlinux) 与我们的 DWARF 逐个比对，
+          #   797 个共同结构体：尺寸全部一致、成员偏移只有 struct module
+          #   不同（根因是 DEBUG_INFO_BTF_MODULES 被关，上面已修）。
+          #   布局等价 ⇒ 用设备的 CRC 是安全的，不会出现「能加载、运行时炸」。
+          #
+          # 注意是**合并**不是替换：本地内核可能还有设备没有的符号，
+          # 直接替换会让这些符号在 modpost 阶段报 undefined。
+          echo "--- 合并设备权威符号表 ---"
+          cp out/Module.symvers out/Module.symvers.ksrc
+          python3 "$GITHUB_WORKSPACE/.github/scripts/merge-symvers.py" \
+            "$GITHUB_WORKSPACE/.github/symvers/device-6.6.118.symvers" \
+            out/Module.symvers.ksrc \
+            out/Module.symvers
+          echo "--- 合并后自检 ---"
+          grep -w module_layout out/Module.symvers
+          # grep -E 不认 \t（POSIX ERE 没有 \t 转义），必须用 printf 生成真分隔符
+          grep -q "$(printf '^0x4e276f37\tmodule_layout\t')" out/Module.symvers \
+            && echo "  ✓ module_layout CRC 已对齐设备（0x4e276f37）" \
+            || { echo "  ✗ module_layout CRC 未对齐，模块必定 insmod 失败"; exit 1; }
 
           # ===== 配置漂移诊断 =====
           # 我们喂进去的是设备 /proc/config.gz，但 olddefconfig 可能会静默改动
@@ -253,6 +309,22 @@ jobs:
             fi
           done
           [ "$FAIL" = 0 ] || { echo "商品校验失败"; exit 1; }
+
+          # ===== 最终闸门：逐个符号比对设备权威 CRC =====
+          # 前面只检查了 __versions 非空。但内核 insmod 时是逐符号比对的，
+          # 只要有一个 CRC 不同就拒绝加载。这里全量比对，不抽样。
+          # 注意 droid_lkm 系列之间有互相导出（droid_lkm_ns_kind_register
+          # 等由 droid_lkm.ko 导出、droid_lkm_misc.ko 使用），那两条只存在于
+          # 模块之间、不在设备内核表里 —— 所以比对时要跳过模块间符号。
+          echo
+          echo "=== 逐符号比对设备权威 CRC ==="
+          mapfile -t KOS < <(find "$GITHUB_WORKSPACE/src" -name '*.ko' -not -path '*/ko/*' | sort)
+          if ! python3 "$GITHUB_WORKSPACE/.github/scripts/check-symvers.py" \
+                 "$GITHUB_WORKSPACE/.github/symvers/device-6.6.118.symvers" "${KOS[@]}"; then
+            echo "✗ 存在与设备不一致的符号 CRC，装到设备上会 insmod 失败"
+            exit 1
+          fi
+          echo "✓ 全部模块的导入符号 CRC 与设备一致"
 
       - name: 上传产物
         uses: actions/upload-artifact@v4

@@ -8,12 +8,18 @@
 *.ko
 !release/**/*.ko
 
+# 设备权威符号表（从 boot_a 的 vmlinux 提取，不是编译产物，必须入库）
+!.github/symvers/*.symvers
+
 # 构建目录
 src/droid_lkm/out/
 src/dist/
 dist/
 out/
 build/
+
+__pycache__/
+*.pyc
 
 # 编辑器 / 系统
 *.swp
