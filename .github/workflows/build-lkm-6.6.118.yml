@@ -91,6 +91,7 @@ jobs:
           #
           # 设备配置取自 /proc/config.gz（7784 行，含 CONFIG_LOCALVERSION="-4k"、
           # MODULE_SIG_ALL、CFI_CLANG 等厂商定制项）。
+          mkdir -p out
           cp "$GITHUB_WORKSPACE/.github/kconfig/device-6.6.118.config" out/.config
           make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
             CROSS_COMPILE=aarch64-linux-gnu- O=out olddefconfig
