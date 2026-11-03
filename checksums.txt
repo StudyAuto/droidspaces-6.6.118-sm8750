@@ -1,0 +1,9 @@
+# Droidspaces 6.6 v1.0.0-6.6 — 文件校验
+# 用法: 在仓库根目录执行  md5sum -c checksums.txt --ignore-missing
+b6367f496ebbb9780b72e1875647ce35  release/v1.0.0/Droidspaces-v1.0.0-6.6.zip
+5e2e52bef6791100fd8f4cdd44d6ec3d  release/v1.0.0/check-webui.sh
+c835b721a16fa2d7df72ef856b84112f  release/v1.0.0/droid_lkm_misc.ko
+5d0afd1035f97a4d54213dc35ce6ba87  release/v1.0.0/fake_config.sh
+9aca82f8ccd2854de422f6fae2d7b768  release/v1.0.0/index.html
+bd696461ad4df6b7cd6ae28dd5a5588c  release/v1.0.0/setup-docker.sh
+0f8dec4c61153209b45e0e8ddb90b403  release/v1.0.0/userns.sh

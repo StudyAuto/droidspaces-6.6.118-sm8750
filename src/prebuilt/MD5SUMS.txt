@@ -1,0 +1,8 @@
+# 预编译产物（6.6 分支，DDK android15-6.6）
+# 位置: dsm/ko/ —— KernelSU 模块实际使用的地方
+840b6048b285df42c666bbf63cbb80ad  dsm/ko/droid_lkm.ko
+c835b721a16fa2d7df72ef856b84112f  dsm/ko/droid_lkm_misc.ko
+6c8e0ca02ebba54b186a38780a5ddbc5  dsm/ko/droid_lkm_pids.ko
+f1db22a678de9df6cf1c3bdd093bd82d  dsm/ko/droid_lkm_vendor.ko
+7fc906bd39c8507607a70f2762c65fd2  dsm/ko/ip6table_nat.ko
+d142ffd92002e7b08248ed4a6a4a9a99  dsm/ko/macvlan.ko

@@ -1,0 +1,6 @@
+id=Droidspaces-6.6
+name=Droidspaces 6.6 (SM8750 / 6.6.118)
+version=v1.0.0-6.6
+versionCode=10000
+author=ai-luo
+description=6 模块仅在 SM8750 / 6.6.118 真机验证过。WebUI: 状态/容器/日志，含每模块开关、卸载确认、机型与内核守卫、bootloop 守卫。默认不自动加载。
