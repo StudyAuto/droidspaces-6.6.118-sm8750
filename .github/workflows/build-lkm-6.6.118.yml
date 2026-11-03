@@ -1,0 +1,152 @@
+name: Build LKM against real 6.6.118 kernel
+
+# 为什么不再用 DDK（android15-6.6）编译：
+#   DDK 的 KDIR 是 6.6.127，编出来的 ko 里 __versions 段是 0 字节
+#   （实测 readelf 确认）。CONFIG_MODVERSIONS=y 的内核加载模块时，
+#   same_magic() 只有在模块带符号 CRC 时才跳过 vermagic 首段；
+#   __versions 为空就等于**没有** CRC，内核会逐字节比较完整版本串
+#   ——能加载只是运气，且 struct 布局（mnt_namespace 等）与设备真实
+#   内核不匹配，运行时才炸（本次 "owner symbols missing" 正是如此）。
+#   所以这里直接用目标机的真实内核源码树编，KDIR 就是它自己。
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master, main]
+    paths:
+      - 'src/droid_lkm/**'
+      - 'src/net_macvlan/**'
+      - 'src/net_ip6nat/**'
+      - '.github/workflows/build-lkm-6.6.118.yml'
+
+env:
+  TZ: Asia/Shanghai
+  # 目标设备实测：6.6.118-android15-8-g899dc6830d9c-abogki500782043-lotus-4k
+  KSRC_BRANCH: oneplus/sm8750_b_16.0.0_oneplus_13_6.6.118
+  KSRC_REPO: cctv18/android_kernel_common_oneplus_sm8750
+  CLANG_URL: https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang18-r510928/clang-r510928.zip
+  TOOLS_URL: https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang18-r510928/build-tools.zip
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev python3 zip unzip aria2 \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu rsync
+
+      - name: 拉取 6.6.118 内核源码
+        run: |
+          set -e
+          mkdir -p "$GITHUB_WORKSPACE/kw"
+          cd "$GITHUB_WORKSPACE/kw"
+          aria2c -s16 -x16 -k1M -q \
+            "https://github.com/${KSRC_REPO}/archive/refs/heads/${KSRC_BRANCH}.zip" \
+            -o ksrc.zip
+          unzip -q ksrc.zip
+          mv android_kernel_common_oneplus_sm8750-* ksrc
+          echo "--- 版本自检 ---"
+          head -6 ksrc/Makefile | grep -E 'VERSION|PATCHLEVEL|SUBLEVEL'
+          grep -q '^SUBLEVEL = 118$' ksrc/Makefile || { echo "SUBLEVEL 不是 118，中止"; exit 1; }
+
+      - name: 拉取 clang-r510928（与设备原厂同一 build）
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE/kw"
+          aria2c -s16 -x16 -k1M -q "$CLANG_URL" -o clang.zip
+          mkdir -p clang
+          unzip -q clang.zip -d clang
+          aria2c -s16 -x16 -k1M -q "$TOOLS_URL" -o tools.zip
+          unzip -q tools.zip
+          CLANG_BIN="$GITHUB_WORKSPACE/kw/clang/bin"
+          [ -d "$CLANG_BIN" ] || CLANG_BIN=$(dirname "$(find "$GITHUB_WORKSPACE/kw/clang" -name clang -type f | head -1)")
+          echo "CLANG_BIN=$CLANG_BIN" >> "$GITHUB_ENV"
+          "$CLANG_BIN/clang" --version | head -2
+
+      - name: 编译内核头（KMI 必须匹配设备）
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE/kw/ksrc"
+          export PATH="$CLANG_BIN:/usr/bin:/bin"
+          # 去掉 ABI 保护导出表，否则模块编译会被 trim 掉符号
+          rm -f android/abi_gki_protected_exports_* || true
+          # 去掉 --dirty 后缀，避免 vermagic 出现 -dirty
+          sed -i 's/echo "+"//' scripts/setlocalversion 2>/dev/null || true
+
+          make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- O=out gki_defconfig
+          # 补齐模块编译需要的配置
+          ./scripts/config --file out/.config \
+            -e MODULES -e MODVERSIONS -e MODULE_UNLOAD \
+            -e KALLSYMS -e KALLSYMS_ALL
+          make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- O=out olddefconfig
+          make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- O=out \
+            prepare modules_prepare
+
+      - name: 编译 droid_lkm
+        run: |
+          set -e
+          export PATH="$CLANG_BIN:/usr/bin:/bin"
+          KDIR="$GITHUB_WORKSPACE/kw/ksrc/out"
+          cd "$GITHUB_WORKSPACE/src/droid_lkm"
+          make VER=android15-6.6 KDIR="$KDIR" \
+            ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- \
+            -j"$(nproc)"
+
+      - name: 编译 macvlan / ip6table_nat
+        run: |
+          set -e
+          export PATH="$CLANG_BIN:/usr/bin:/bin"
+          KDIR="$GITHUB_WORKSPACE/kw/ksrc/out"
+          cd "$GITHUB_WORKSPACE/src/net_macvlan"
+          make KDIR="$KDIR" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" || true
+          cd "$GITHUB_WORKSPACE/src/net_ip6nat"
+          make KDIR="$KDIR" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" || true
+
+      - name: 校验产物（vermagic + __versions 必须非空）
+        run: |
+          set -e
+          echo "=== 产物 ==="
+          find "$GITHUB_WORKSPACE/src" -name '*.ko' -not -path '*/ko/*' | sort
+          echo
+          FAIL=0
+          for f in $(find "$GITHUB_WORKSPACE/src" -name '*.ko' -not -path '*/ko/*'); do
+            echo "--- $(basename "$f")"
+            vm=$(modinfo -F vermagic "$f" 2>/dev/null || strings "$f" | grep -m1 '^vermagic=')
+            echo "    $vm"
+            case "$vm" in
+              6.6.118*) echo "    ✓ vermagic 6.6.118" ;;
+              *) echo "    ✗ vermagic 不是 6.6.118"; FAIL=1 ;;
+            esac
+            sz=$(readelf -SW "$f" | awk '/ __versions /{print strtonum("0x"$6)}')
+            echo "    __versions size = ${sz:-0} bytes"
+            if [ "${sz:-0}" -gt 0 ]; then
+              echo "    ✓ 含符号 CRC（CONFIG_MODVERSIONS 生效）"
+            else
+              echo "    ✗ __versions 为空 —— 内核会逐字节比较 vermagic，布局不匹配会崩"
+              FAIL=1
+            fi
+          done
+          [ "$FAIL" = 0 ] || { echo "商品校验失败"; exit 1; }
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: lkm-6.6.118-${{ github.run_number }}
+          path: |
+            src/droid_lkm/out/**/*.ko
+            src/net_macvlan/*.ko
+            src/net_ip6nat/*.ko
+          if-no-files-found: error
+          retention-days: 30
