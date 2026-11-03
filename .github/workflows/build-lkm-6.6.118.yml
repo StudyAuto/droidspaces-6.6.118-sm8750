@@ -100,18 +100,24 @@ jobs:
           done
           grep -q '^CONFIG_LOCALVERSION="-4k"' out/.config && echo "  ✓ LOCALVERSION=-4k" || echo "  ! LOCALVERSION 不是 -4k"
 
-          # 关掉 TRIM_UNUSED_KSYMS。
-          # 设备内核开了它（导出表被裁剪），但裁剪结果 abi_symbollist.raw
-          # 是 GKI 完整构建流程的中间产物，我们直接拿设备配置编没有那一步，
-          # 报 "No rule to make target 'abi_symbollist.raw'"。
-          # 对**编译模块**而言 trim 与否只影响 Module.symvers 的符号集合：
-          # 不 trim 时符号更全，modpost 更容易过；而设备侧真正能解析哪些
-          # 符号，由模块加载时的 __versions CRC 与内核导出表决定，不受影响。
-          ./scripts/config --file out/.config -d TRIM_UNUSED_KSYMS
-          make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-            CROSS_COMPILE=aarch64-linux-gnu- O=out olddefconfig
-          grep -q '^# CONFIG_TRIM_UNUSED_KSYMS is not set' out/.config &&
-            echo "  ✓ TRIM_UNUSED_KSYMS 已关闭（避免 abi_symbollist.raw 依赖）"
+          # ⚠️ 必须保留 TRIM_UNUSED_KSYMS=y（设备配置就是这样）。
+          #
+          # 上一轮我把它关掉来绕过 "No rule to make target 'abi_symbollist.raw'"，
+          # 结果模块全部报 "disagrees about version of symbol module_layout" ——
+          # 因为 TRIM 改变导出符号集，进而改变 module_layout 的 CRC 计算基线。
+          #
+          # 真正的原因：CONFIG_UNUSED_KSYMS_WHITELIST="abi_symbollist.raw"，
+          # 这个白名单本该由 GKI 完整流程从 vmlinux 符号表生成。
+          # 我们直接拿设备配置编，没有那一步，所以文件不存在。
+          #
+          # 解法：提供一个**空**的 abi_symbollist.raw。
+          # 空白名单 = 不额外保留任何"未使用"符号，这与设备内核的实际行为
+          # （TRIM 已裁掉未使用符号）最接近；符号集由源码本身决定，不是白名单。
+          # 文件放在 srctree 根（Makefile 里 $(srctree)/abi_symbollist.raw）。
+          : > abi_symbollist.raw
+          echo "  ✓ 已生成空 abi_symbollist.raw（TRIM 保持启用，与设备一致）"
+          grep -q '^CONFIG_TRIM_UNUSED_KSYMS=y' out/.config &&
+            echo "  ✓ TRIM_UNUSED_KSYMS=y 保持不变"
 
           # ⚠️ 必须完整编一遍内核，不能只 modules_prepare。
           # 只 prepare 不会生成 Module.symvers，modpost 阶段所有内核导出符号
@@ -126,6 +132,25 @@ jobs:
           SYMS=$(wc -l < out/Module.symvers)
           echo "导出符号数: $SYMS"
           [ "$SYMS" -gt 1000 ] || { echo "Module.symvers 太小，内核没编完整"; exit 1; }
+
+          # ===== 关键诊断：module_layout 的 CRC =====
+          # 这是内核加载模块时唯一强校验的符号，代表 struct module 的布局。
+          # 把它的 CRC 打出来，与设备期望值比对即可判断配置是否真的匹配。
+          echo "--- module_layout CRC（决定能否加载）---"
+          grep -w module_layout out/Module.symvers || echo "  (Module.symvers 里没有 module_layout!)"
+
+          # ===== 配置漂移诊断 =====
+          # 我们喂进去的是设备 /proc/config.gz，但 olddefconfig 可能会静默改动
+          # 依赖项。这里把最终 .config 与我们提供的比一遍，漂移一目了然。
+          echo "--- 配置漂移（设备配置 → 实际使用）---"
+          DIFF_OUT=/tmp/cfgdiff.txt
+          diff <(sort "$GITHUB_WORKSPACE/.github/kconfig/device-6.6.118.config") \
+               <(sort out/.config) > "$DIFF_OUT" || true
+          echo "漂移行数: $(wc -l < "$DIFF_OUT")"
+          echo "--- 前 60 行漂移 ---"
+          head -60 "$DIFF_OUT"
+          echo "--- 直接影响 module 布局的项 ---"
+          grep -E '>(CONFIG_(MODULE_UNLOAD|MODULE_SIG|MODULE_STATS|LIVEPATCH|TRACEPOINTS|EVENT_TRACING|MODULES_TREE_LOOKUP|MODULE_UNLOAD_TAINT|TRIM_UNUSED|UNUSED_KSYMS_WHITELIST|RANDSTRUCT|CFI_CLANG)[= ])' "$DIFF_OUT" || echo "  (这些项无漂移)"
 
       - name: 编译 droid_lkm
         run: |
