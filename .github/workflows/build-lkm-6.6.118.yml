@@ -185,10 +185,15 @@ jobs:
           export PATH="$CLANG_BIN:/usr/bin:/bin"
           KDIR="$GITHUB_WORKSPACE/kw/ksrc/out"
           KM="ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu-"
-          # 探针不引用任何内核结构体，只读 __crc_module_layout。
-          # 它用来回答一个用猜解决不了的问题：
+          # 探针回答一个用猜解决不了的问题：
           #   设备内核期望的 module_layout CRC 到底是几？
           # 知道这个值，就能直接判断我们的配置是否真的匹配。
+          #
+          # 它不引用任何内核结构体、不改状态，只读两段内核数据：
+          #   __ksymtab（遍历找 module_layout 的名字）
+          #   __kcrctab（同下标取 4 字节 CRC）
+          # 段基址由用户态从 /proc/kallsyms 读出后作为模块参数传入
+          # （kallsyms_lookup_name 未导出，模块自己查不到）。
           make -C "$KDIR" M="$GITHUB_WORKSPACE/.github/probe" $KM \
             -j"$(nproc)" modules
           ls -la "$GITHUB_WORKSPACE/.github/probe/crcprobe.ko"
