@@ -75,8 +75,6 @@ jobs:
           set -e
           cd "$GITHUB_WORKSPACE/kw/ksrc"
           export PATH="$CLANG_BIN:/usr/bin:/bin"
-          # 去掉 ABI 保护导出表，否则模块编译会被 trim 掉符号
-          rm -f android/abi_gki_protected_exports_* || true
           # 去掉 --dirty 后缀，避免 vermagic 出现 -dirty
           sed -i 's/echo "+"//' scripts/setlocalversion 2>/dev/null || true
 
@@ -101,6 +99,19 @@ jobs:
             grep -q "^$k=y" out/.config && echo "  ✓ $k=y" || { echo "  ✗ $k 未开启"; exit 1; }
           done
           grep -q '^CONFIG_LOCALVERSION="-4k"' out/.config && echo "  ✓ LOCALVERSION=-4k" || echo "  ! LOCALVERSION 不是 -4k"
+
+          # 关掉 TRIM_UNUSED_KSYMS。
+          # 设备内核开了它（导出表被裁剪），但裁剪结果 abi_symbollist.raw
+          # 是 GKI 完整构建流程的中间产物，我们直接拿设备配置编没有那一步，
+          # 报 "No rule to make target 'abi_symbollist.raw'"。
+          # 对**编译模块**而言 trim 与否只影响 Module.symvers 的符号集合：
+          # 不 trim 时符号更全，modpost 更容易过；而设备侧真正能解析哪些
+          # 符号，由模块加载时的 __versions CRC 与内核导出表决定，不受影响。
+          ./scripts/config --file out/.config -d TRIM_UNUSED_KSYMS
+          make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- O=out olddefconfig
+          grep -q '^# CONFIG_TRIM_UNUSED_KSYMS is not set' out/.config &&
+            echo "  ✓ TRIM_UNUSED_KSYMS 已关闭（避免 abi_symbollist.raw 依赖）"
 
           # ⚠️ 必须完整编一遍内核，不能只 modules_prepare。
           # 只 prepare 不会生成 Module.symvers，modpost 阶段所有内核导出符号
