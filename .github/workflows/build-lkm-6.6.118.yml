@@ -17,6 +17,8 @@ on:
       - 'src/droid_lkm/**'
       - 'src/net_macvlan/**'
       - 'src/net_ip6nat/**'
+      - '.github/probe/**'
+      - '.github/kconfig/**'
       - '.github/workflows/build-lkm-6.6.118.yml'
 
 env:
