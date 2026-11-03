@@ -70,7 +70,7 @@ jobs:
           echo "CLANG_BIN=$CLANG_BIN" >> "$GITHUB_ENV"
           "$CLANG_BIN/clang" --version | head -2
 
-      - name: 编译内核头（KMI 必须匹配设备）
+      - name: 编译内核（生成 Module.symvers 与符号 CRC）
         run: |
           set -e
           cd "$GITHUB_WORKSPACE/kw/ksrc"
@@ -80,17 +80,40 @@ jobs:
           # 去掉 --dirty 后缀，避免 vermagic 出现 -dirty
           sed -i 's/echo "+"//' scripts/setlocalversion 2>/dev/null || true
 
-          make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-            CROSS_COMPILE=aarch64-linux-gnu- O=out gki_defconfig
-          # 补齐模块编译需要的配置
-          ./scripts/config --file out/.config \
-            -e MODULES -e MODVERSIONS -e MODULE_UNLOAD \
-            -e KALLSYMS -e KALLSYMS_ALL
+          # ⚠️ 必须用**设备真实配置**，不能用 gki_defconfig。
+          #
+          # 原因：CONFIG_MODVERSIONS=y 时，模块里每个导入符号都带一个 CRC，
+          # 该 CRC 由内核的类型签名算出，而类型签名依赖具体配置
+          # （结构体成员随 CONFIG_* 增删而变）。用 gki_defconfig 编出来的
+          # Module.symvers，CRC 与设备内核不同 → 加载时报
+          # "disagrees about version of symbol"，或更糟：CRC 恰好相同但
+          # 结构体布局不同，运行时才炸（本次 userns 失败即此类）。
+          #
+          # 设备配置取自 /proc/config.gz（7784 行，含 CONFIG_LOCALVERSION="-4k"、
+          # MODULE_SIG_ALL、CFI_CLANG 等厂商定制项）。
+          cp "$GITHUB_WORKSPACE/.github/kconfig/device-6.6.118.config" out/.config
           make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
             CROSS_COMPILE=aarch64-linux-gnu- O=out olddefconfig
+
+          echo "--- 配置自检 ---"
+          for k in CONFIG_MODVERSIONS CONFIG_MODULES CONFIG_KALLSYMS CONFIG_CFI_CLANG; do
+            grep -q "^$k=y" out/.config && echo "  ✓ $k=y" || { echo "  ✗ $k 未开启"; exit 1; }
+          done
+          grep -q '^CONFIG_LOCALVERSION="-4k"' out/.config && echo "  ✓ LOCALVERSION=-4k" || echo "  ! LOCALVERSION 不是 -4k"
+
+          # ⚠️ 必须完整编一遍内核，不能只 modules_prepare。
+          # 只 prepare 不会生成 Module.symvers，modpost 阶段所有内核导出符号
+          # （_printk / proc_create / seq_puts ...）都会报 undefined，模块编不出来。
+          # Module.symvers 同时提供符号 CRC —— 这正是 CONFIG_MODVERSIONS 需要的。
           make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
             CROSS_COMPILE=aarch64-linux-gnu- O=out \
-            prepare modules_prepare
+            KCFLAGS=-Wno-error all
+
+          echo "--- Module.symvers 自检 ---"
+          ls -la out/Module.symvers
+          SYMS=$(wc -l < out/Module.symvers)
+          echo "导出符号数: $SYMS"
+          [ "$SYMS" -gt 1000 ] || { echo "Module.symvers 太小，内核没编完整"; exit 1; }
 
       - name: 编译 droid_lkm
         run: |
