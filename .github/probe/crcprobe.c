@@ -1,66 +1,46 @@
-// 探针：把设备内核的**完整导出符号表 + CRC** 导出成 Module.symvers。
+// 探针：把设备内核的完整导出符号表 + CRC 导出，供用户态读走。
 //
-// 为什么不再尝试"复现内核构建环境"：
-//   设备内核 6.6.118-android15-8-g899dc6830d9c 是第三方基于官方源码编译的，
-//   带 KSU/SUSFS/厂商补丁；公开仓库里没有这个 commit，也复现不出同样的
-//   struct 布局。实测 module_layout CRC：
-//       设备   0x4e276f37
-//       我们   0x6500052f   ← 完全不同
-//   所以无论怎么调 CONFIG 都编不出能加载的模块。
+// 为什么需要（前一轮实测已确认）：
+//   设备 module_layout CRC = 0x4e276f37
+//   我们编译出来的       = 0x6500052f   ← 完全不同
+// 设备内核是第三方基于官方源码 + KSU/SUSFS/厂商补丁编的，公开仓库里
+// 没有对应 commit，struct 布局复现不出来。所以不再尝试复现构建环境，
+// 改为直接读设备内核自己的 __kcrctab —— 那是权威来源。
 //
-// 正解：设备内核自己的 __kcrctab 就是权威来源。
-//   把 __ksymtab（名字/命名空间）与 __kcrctab（CRC，顺序一一对应）读出来，
-//   生成一份完全匹配设备的 Module.symvers，再用它编译模块。
-//   这样每个导入符号的 CRC 都与设备一致，__versions 校验自然通过。
+// 为什么用 proc 节点而不是直接写文件：
+//   filp_open / kernel_write 在 GKI 上属于受限命名空间且可能未被导出
+//   （实测 insmod 报 "Unknown symbol filp_open err -2"）。
+//   proc_create + seq_printf 是模块读数据给用户态的标准做法，符号可用。
 //
 // 原理：CONFIG_HAVE_ARCH_PREL32_RELOCATIONS 下
 //   struct kernel_symbol { s32 value_offset; s32 name_offset; s32 namespace_offset; }
-//   12 字节；__kcrctab 每项 4 字节，顺序对应。
+//   12 字节，按导出顺序排在 __ksymtab；__kcrctab 每项 4 字节，顺序一一对应。
 //
-// 安全：只读内核数据段，不引用任何内核结构体、不改状态。
+// 安全：只读内核数据段，不引用任何内核结构体、不改任何状态。
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/uaccess.h>
 #include <linux/string.h>
-#include <linux/fs.h>
-#include <linux/file.h>
-#include <linux/version.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("export the running kernel export table as Module.symvers");
-
-/* filp_open / kernel_write 在 GKI 里属于受限命名空间，
- * 不写 MODULE_IMPORT_NS 会被 modpost 拒绝。 */
-MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
+MODULE_DESCRIPTION("export the running kernel export table with CRCs");
 
 static unsigned long ksymtab_base;
-static unsigned long kcrctab_base;
 static unsigned long ksymtab_end;
-static char *out_path = "/data/local/tmp/device.symvers";
+static unsigned long kcrctab_base;
 module_param(ksymtab_base, ulong, 0444);
-module_param(kcrctab_base, ulong, 0444);
 module_param(ksymtab_end, ulong, 0444);
-module_param(out_path, charp, 0444);
+module_param(kcrctab_base, ulong, 0444);
 
 #define KSYM_ENTRY 12
 #define MAX_SCAN   8192
 
-static int __init crcprobe_init(void)
+static int crcprobe_show(struct seq_file *m, void *v)
 {
-	struct file *f;
-	loff_t pos = 0;
-	int i, written = 0;
-
-	if (!ksymtab_base || !kcrctab_base || !ksymtab_end) {
-		pr_info("CRCPROBE: missing section bases\n");
-		return -EINVAL;
-	}
-
-	f = filp_open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-	if (IS_ERR(f)) {
-		pr_info("CRCPROBE: open %s failed %ld\n", out_path, PTR_ERR(f));
-		return -EINVAL;
-	}
+	int i;
+	int n = 0;
 
 	for (i = 0; i < MAX_SCAN; i++) {
 		unsigned long entry = ksymtab_base + (unsigned long)i * KSYM_ENTRY;
@@ -68,8 +48,6 @@ static int __init crcprobe_init(void)
 		unsigned long name_addr;
 		char name[128];
 		u32 crc = 0;
-		char line[196];
-		int len;
 
 		if (entry + KSYM_ENTRY > ksymtab_end)
 			break;
@@ -83,20 +61,52 @@ static int __init crcprobe_init(void)
 		if (!name[0])
 			continue;
 
-		if (copy_from_kernel_nofault(&crc, (void *)(kcrctab_base + (unsigned long)i * 4),
-					     sizeof(crc)))
+		if (copy_from_kernel_nofault(&crc,
+				(void *)(kcrctab_base + (unsigned long)i * 4), sizeof(crc)))
 			continue;
 
-		// Module.symvers 格式：CRC \t 名字 \t 模块 \t 导出类型
-		len = scnprintf(line, sizeof(line), "0x%08x\t%s\tvmlinux\tEXPORT_SYMBOL\n",
-				crc, name);
-		if (kernel_write(f, line, len, &pos) == len)
-			written++;
+		/* Module.symvers 格式：CRC \t 名字 \t 模块 \t 导出类型 */
+		seq_printf(m, "0x%08x\t%s\tvmlinux\tEXPORT_SYMBOL\n", crc, name);
+		n++;
 	}
+	seq_printf(m, "# total %d entries\n", n);
+	return 0;
+}
 
-	filp_close(f, NULL);
-	pr_info("CRCPROBE: wrote %d symbols to %s\n", written, out_path);
-	return -EINVAL;
+static int crcprobe_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, crcprobe_show, NULL);
+}
+
+static const struct proc_ops crcprobe_pops = {
+	.proc_open	= crcprobe_open,
+	.proc_read	= seq_read,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= single_release,
+};
+
+static struct proc_dir_entry *crcprobe_entry;
+
+static int __init crcprobe_init(void)
+{
+	if (!ksymtab_base || !ksymtab_end || !kcrctab_base) {
+		pr_info("CRCPROBE: missing section bases\n");
+		return -EINVAL;
+	}
+	crcprobe_entry = proc_create("crcprobe", 0444, NULL, &crcprobe_pops);
+	if (!crcprobe_entry) {
+		pr_info("CRCPROBE: proc_create failed\n");
+		return -EINVAL;
+	}
+	pr_info("CRCPROBE: ready, read /proc/crcprobe\n");
+	return 0; /* 驻留，供用户态读取；用完 rmmod */
+}
+
+static void __exit crcprobe_exit(void)
+{
+	if (crcprobe_entry)
+		proc_remove(crcprobe_entry);
 }
 
 module_init(crcprobe_init);
+module_exit(crcprobe_exit);

@@ -200,9 +200,8 @@ jobs:
             -j"$(nproc)" modules
           ls -la "$GITHUB_WORKSPACE/.github/probe/crcprobe.ko"
 
-          # 清掉探针的 __versions：它只读一个 unsigned long，
-          # 没有任何结构体依赖，跳过 CRC 检查是安全的。
-          # 这样设备才肯加载它、把答案打出来。
+          # 清掉探针的 __versions：它只读两段内核数据、不碰任何结构体，
+          # 跳过 CRC 检查是安全的。这样设备才肯加载它。
           CP="$GITHUB_WORKSPACE/.github/probe/crcprobe.ko"
           python3 - "$CP" <<'PYEOF'
           import struct, sys
