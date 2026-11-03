@@ -6,6 +6,59 @@
 
 ---
 
+## v1.0.1-6.6 — 2026-11-03
+
+**安全修复：`/proc/config.gz` 伪装会导致 system_server 崩溃、整机重启。**
+
+### 修复（严重，必须升级）
+
+- **`fake_config.sh`：伪装文件的 SELinux 类型错误**
+  - 现象：开机后 system_server 反复 SIGABRT、整机重启、所有应用被杀
+  - 崩溃信息：`Check failed: result == OK Kernel configs could not be fetched.
+    b/151092221`，栈顶是 `Debug.isVmapStack` ← `MemInfoReader.getKernelUsedSizeKb`
+    ← `AppProfiler.updateCachedAppsSnapshot`
+  - 根因：旧版把 `/data/adb` 下的文件直接 bind 到 `/proc/config.gz`，那个文件的
+    SELinux 类型是 `adb_data_file`，而真文件是 `config_gz`。system_server（uid 1000）
+    读不到 → AOSP 的 `LOG(FATAL)` 硬断言 → SIGABRT。每次 `updateCachedAppsSnapshot`
+    都会走这条路，必崩而非偶发
+  - 旧代码用 `chcon` 试图修标签，但 ksu 域**没有 relabel 权限**（实测 `rc=1`），
+    且 `2>/dev/null` 把失败吞了，脚本继续挂载
+  - 修复：改用 **tmpfs 挂载时带 `context=u:object_r:config_gz:s0`**，
+    文件继承正确的 SELinux 类型（chcon 与 `mount --bind -o context=` 均实测无效）
+- **`fake_config.sh`：加四道保护，任一失败即放弃伪装**
+  1. tmpfs 起不来 → 放弃，不降级成错误类型的 bind
+  2. 挂载前验证暂存文件类型 == `config_gz`
+  3. 挂载后再次验证，不符立刻 umount 回滚
+  4. 内容自检（两项确实都改成 `y`），否则回滚
+- **`service.sh`：不再无视用户的安全开关**
+  - 旧版把 `fake_config.sh` 放在**最前面无条件执行**。用户写了 `no_boot`、
+    在管理器里禁用模块后，`post-fs-data.sh` 正确跳过（`history.log` 有
+    `BOOT SKIP (no_boot)`），但 `service.sh` 照样挂载 `/proc/config.gz` ——
+    用户的"关闭"完全没生效
+  - 现在开头检查 `disable` / `no_boot` / `blocked`，任一存在就不碰系统文件
+- **`uninstall.sh`：补齐两层挂载的清理**
+  - 原来只 `umount /proc/config.gz`，留下 `.cfgtmp` 这个 tmpfs 挂载点
+  - 现在按「先解 bind 再解 tmpfs」的顺序拆，并清理旧版留下的错误类型文件
+
+### 新增
+
+- `scripts/check-configgzip.sh`：把上面这些规则写成 6 条断言
+  （必须是 tmpfs context= / 不得依赖 chcon / 挂载前后双验证 /
+  service.sh 开关顺序 / 必须检查 disable / uninstall 两层都拆）。
+  **已接入 `package-ksu-zip.sh`，不通过拒绝打包**。
+  用旧版文件实测能准确报出 5 项违规，新版 6 项全过。
+- `docs/TROUBLESHOOTING.md` 新增「伪装文件的 SELinux 类型必须是 config_gz」
+  一节，含完整崩溃栈、标签对比、四道保护说明与 `service.sh` 的教训
+
+### 验证
+
+- 修复版在真机上：`/proc/config.gz` 标签为 `u:object_r:config_gz:s0`、
+  内容两项均为 `y`、**system_server 存活无新崩溃**
+- 幂等性：重复执行不重复挂载；手动 umount 后能正确补回
+- 撤回路径：`umount /proc/config.gz` + `umount .cfgtmp` 后恢复原文件
+
+---
+
 ## v1.0.0-6.6 — 2026-11-03
 
 首个 6.6 版本。**真机验证通过（一加 13 / OP5D0DL1 / 6.6.118）**。

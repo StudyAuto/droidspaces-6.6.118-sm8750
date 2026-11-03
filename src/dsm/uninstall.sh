@@ -12,8 +12,16 @@ for r in /data/local/Droidspaces/Containers/*/rootfs/.droid-userns-owner; do
 	break
 done
 
-# 撤掉 /proc/config.gz 的伪装，把真实内核配置还回去
+# 撤掉 /proc/config.gz 的伪装，把真实内核配置还回去。
+# 顺序要紧：先解 bind（/proc/config.gz），再解暂存 tmpfs（.cfgtmp），
+# 否则 tmpfs 还被 bind 引用着，umount 会 EBUSY。
 umount /proc/config.gz 2>/dev/null
+umount "$MODDIR/.cfgtmp" 2>/dev/null
+rm -f "$MODDIR/.cfgtmp/config.gz" 2>/dev/null
+rmdir "$MODDIR/.cfgtmp" 2>/dev/null
+# 旧版留下的错误类型伪装文件（adbd_data_file，会导致 system_server 崩溃），一并清掉
+rm -rf "$MODDIR/etc/config.gz" 2>/dev/null
+rmdir "$MODDIR/etc" 2>/dev/null
 
 for m in ip6table_nat macvlan droid_lkm_pids droid_lkm_misc droid_lkm_vendor droid_lkm; do
 	rmmod "$m" 2>/dev/null

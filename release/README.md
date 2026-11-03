@@ -7,7 +7,36 @@ zip 里含完整 KernelSU 模块（`module.prop` + 脚本 + `ko/` + `webroot/`�
 
 ---
 
-## v1.0.0-6.6（当前版本）
+## v1.0.1-6.6（当前版本）— **安全修复，必须升级**
+
+> ⚠️ **v1.0.0 有一个会导致整机反复重启的严重 bug，请勿使用。**
+> `fake_config.sh` 把 `/proc/config.gz` 换成的文件 SELinux 类型错误（`adb_data_file`
+> 而非 `config_gz`），`system_server` 读不到就触发 AOSP 硬断言
+> （`Kernel configs could not be fetched. b/151092221`）→ SIGABRT → 整机重启。
+> 而且 `service.sh` 会无视 `no_boot` / `disable`，用户"关掉模块"也没用。
+> 详见 [`docs/TROUBLESHOOTING.md`](../docs/TROUBLESHOOTING.md) ⑤ 与 [`CHANGELOG.md`](../CHANGELOG.md)。
+
+| 文件 | 大小 | md5 | 用途 |
+|---|---|---|---|
+| `Droidspaces-v1.0.1-6.6.zip` | 5.9 MB | `2849ad741ef2146f90858873eec91d51` | 完整包，KernelSU 刷入 |
+| `droid_lkm_misc.ko` | 3.5 MB | `c835b721a16fa2d7df72ef856b84112f` | 单独的内核模块 |
+| `index.html` | 80 KB | `9aca82f8ccd2854de422f6fae2d7b768` | WebUI 页面 |
+| `setup-docker.sh` | 4.2 KB | `bd696461ad4df6b7cd6ae28dd5a5588c` | 容器内 Docker 一键配置 |
+| `fake_config.sh` | 5.8 KB | `fc2fcbbcba7edc24ef98ce3d6a036091` | 伪装 config.gz（**本版已修 SELinux 类型**） |
+| `service.sh` | 2.1 KB | `422463089982556e300bc722a49e7e41` | 存活确认（**本版已尊重 no_boot/disable**） |
+| `uninstall.sh` | 1.5 KB | `0178518dba430fe6f8af43dec9364781` | 卸载清理（**本版补齐两层挂载**） |
+| `check-webui.sh` | 3.0 KB | `5e2e52bef6791100fd8f4cdd44d6ec3d` | WebUI 语法/DOM 守卫 |
+| `check-configgzip.sh` | 4.2 KB | `1aed4b0f8f26e6d4c52b4d87c6a38d32` | config.gz 安全守卫（新增） |
+
+本版修复验证（真机 2026-11-03）：
+
+- 伪装后 `/proc/config.gz` 标签为 `u:object_r:config_gz:s0`（与真文件一致）
+- 内容两项均为 `y`，普通进程可读
+- **system_server 存活，无新崩溃**
+
+---
+
+## v1.0.0-6.6（**已废弃，勿用** —— 会崩系统）
 
 | 文件 | 大小 | md5 | 用途 |
 |---|---|---|---|

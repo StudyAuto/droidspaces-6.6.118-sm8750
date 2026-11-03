@@ -185,7 +185,7 @@ v1.0.0 的 `userns.sh relabel` 会先检查有没有进程真在 userns 里：
 
 **处理**（`fake_config.sh`，模块已自带）：
 
-把 `config.gz` 解开、改两行、重压缩，bind mount 覆盖 `/proc/config.gz`。
+把 `config.gz` 解开、改两行、重压缩，覆盖 `/proc/config.gz`。
 
 ```sh
 su -c 'sh /data/adb/modules/Droidspaces-6.6/tools/fake_config.sh'
@@ -200,7 +200,68 @@ su -c 'zcat /proc/config.gz | grep -E "CONFIG_USER_NS|CONFIG_DEVTMPFS"'
 
 ```sh
 su -c 'umount /proc/config.gz'
+su -c 'umount /data/adb/modules/Droidspaces-6.6/.cfgtmp'
 ```
+
+### ⚠️ 伪装文件的 SELinux 类型必须是 `config_gz`（2026-11-03 血泪教训）
+
+**这一节是真实线上故障的记录，改 `fake_config.sh` 前必须读完。**
+
+**症状**：手机开机后 system_server 反复崩溃、整机重启，应用全部被杀。
+dropbox 里有 `system_server_native_crash`，abort message 是：
+
+```text
+Check failed: result == OK Kernel configs could not be fetched. b/151092221
+  #04 android_os_Debug_isVmapStack
+  #07 MemInfoReader.getKernelUsedSizeKb
+  #08 AppProfiler$CachedAppsWatermarkData.updateCachedAppsSnapshot
+```
+
+**原因**：旧版把 `/data/adb/.../etc/config.gz` 直接 bind 到 `/proc/config.gz`。
+那个文件的 SELinux 类型是 **`adb_data_file`**，而真文件是 **`config_gz`**：
+
+```text
+真文件    /proc/config.gz          u:object_r:config_gz:s0      ← system_server 可读
+错类型    (bind 自 /data/adb)      u:object_r:adb_data_file:s0  ← system_server 读不到
+```
+
+`system_server`（uid 1000）读不到 → `Debug.isVmapStack()` 的 `ReadFileToString`
+失败 → AOSP 里是 `LOG(FATAL)` 硬断言 → **SIGABRT → 整机重启**。
+它每次 `updateCachedAppsSnapshot` 都会走这条路径，**不是偶发，是必崩**。
+
+旧代码试图用 `chcon "$CTX" "$DST" 2>/dev/null` 修标签，但：
+
+- ksu 域**没有 relabel 权限**，`chcon` 到 `config_gz` 直接被拒（实测 `rc=1`）；
+- `2>/dev/null` 把失败**吞掉了**，脚本继续往下挂载 —— 埋雷。
+
+**正确做法**（现在的实现）：用 **tmpfs 挂载时的 `context=`** 设类型，文件继承挂载点上下文：
+
+```sh
+mount -t tmpfs -o "size=512k,mode=755,context=u:object_r:config_gz:s0" tmpfs "$STAGE"
+```
+
+实测这样建出来的文件标签就是 `config_gz`，bind 到 `/proc/config.gz` 后
+`system_server` 能正常读取（修复后 system_server 存活、无新崩溃）。
+
+脚本现在有四道保护，任何一道不过就**放弃伪装**（App 显示 userns 不可用），
+绝不把错类型的文件盖上去：
+
+1. tmpfs 起不来 → 放弃（不退化成错误类型的 bind）
+2. 挂载前验证暂存文件类型 == `config_gz`
+3. 挂载后再次验证 `/proc/config.gz` 类型 == `config_gz`，不符立刻 umount
+4. 内容自检：两项确实都变成了 `y`，否则回滚
+
+**另一个必须记住的坑：`service.sh` 曾经无视 `no_boot`。**
+
+用户写了 `no_boot`、在管理器里禁用了模块，`post-fs-data.sh` 正确跳过
+（`history.log` 有 `BOOT SKIP (no_boot)`），但 `service.sh` 把
+`fake_config.sh` 放在**最前面无条件执行** —— 用户的"关闭"完全没生效，
+照样挂载、照样崩。
+
+现在 `service.sh` 会在开头检查 `disable` / `no_boot` / `blocked`，任一存在就不碰系统文件。
+**规则：任何会改动系统状态的动作，都必须先过这三道开关。**
+
+校验脚本 `scripts/check-configgzip.sh` 把以上规则都写成了断言，已接入打包流程。
 
 ---
 

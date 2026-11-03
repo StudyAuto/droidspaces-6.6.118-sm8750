@@ -226,11 +226,16 @@ userns                   unsupported    owner symbols missing
 >
 > | 位置 | 值 | 说明 |
 > |---|---|---|
-> | 宿主 | `CONFIG_USER_NS=y` | `tools/fake_config.sh` bind mount 伪装，为骗过 App 探测 |
+> | 宿主 | `CONFIG_USER_NS=y` | `tools/fake_config.sh` 伪装（tmpfs + `context=config_gz`），为骗过 App 探测 |
 > | 容器内 | `# CONFIG_USER_NS is not set` | 容器有自己的 `/proc`，这是真实内核配置 |
 >
 > 模块状态的 `unsupported` 与容器内那份一致。宿主侧的 `y` 不能当判据。
 > （`umount /proc/config.gz` 也能在宿主上看到真实值，但下次服务重启会被重新伪装。）
+>
+> ⚠️ **伪装文件的 SELinux 类型必须与真文件一致（`config_gz`）**，否则 `system_server`
+> 读不到会 SIGABRT 导致整机重启 —— v1.0.0 真实踩过。v1.0.1 改用 tmpfs 的
+> `context=` 设置类型，并加了挂载前后双验证与回滚。详见
+> [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) ⑤。
 
 ---
 

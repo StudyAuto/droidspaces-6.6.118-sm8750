@@ -23,6 +23,13 @@ sh "$ROOT/scripts/check-webui.sh" || {
 	exit 1
 }
 
+# 安全守卫：/proc/config.gz 伪装一旦类型设错，system_server 会 SIGABRT 导致整机重启
+# （2026-11-03 已真实发生过）。同样必须在打包前拦住。
+sh "$ROOT/scripts/check-configgzip.sh" || {
+	echo "✗ config.gz 安全守卫未通过，拒绝打包"
+	exit 1
+}
+
 rm -f "$OUT"
 (cd "$DSM" && zip -qr9 "$OUT" .)
 
