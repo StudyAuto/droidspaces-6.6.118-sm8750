@@ -29,6 +29,10 @@
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("export the running kernel export table as Module.symvers");
 
+/* filp_open / kernel_write 在 GKI 里属于受限命名空间，
+ * 不写 MODULE_IMPORT_NS 会被 modpost 拒绝。 */
+MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
+
 static unsigned long ksymtab_base;
 static unsigned long kcrctab_base;
 static unsigned long ksymtab_end;
