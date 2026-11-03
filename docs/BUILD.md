@@ -1,7 +1,17 @@
 # 从源码到 .ko 的完整构建流程
 
 本文档记录从零到产出 6 个 ko 的**全部**步骤，可复现。
-已在 2026-11-03 实跑通过。
+
+**两条路线，按场景选：**
+
+| 路线 | 适用 | 入口 |
+|---|---|---|
+| **GitHub Actions**（当前主线） | 换内核 / 换机型 / 日常重编译 | `.github/workflows/build-lkm-6.6.118.yml` |
+| 本地 DDK | 只在 Actions 不可用时 | 本文 §1 起 |
+
+> ⚠️ 无论走哪条，**符号 CRC 一致性**都是决定成败的唯一关卡。
+> 取设备权威符号表、合并、出货闸门的完整方法论见
+> **[KERNEL-ADAPTATION.md](KERNEL-ADAPTATION.md)**，先读它再动手。
 
 ---
 
@@ -196,16 +206,22 @@ cd src/dsm/ko
 
 # ① vermagic 是 6.6 线
 for f in *.ko; do printf "%-22s " "$f"; strings "$f" | grep -m1 vermagic=; done
-
-# ② 依赖的符号设备上全都有（需要设备 adb）
-ADB=/mnt/c/Windows/System32/adb.exe
-$ADB shell 'su -c "grep \" __ksymtab_\" /proc/kallsyms | sed \"s/.*__ksymtab_//\""' \
-  | tr -d '\r' | sort -u > /tmp/dev_exports.txt
-for f in *.ko; do aarch64-linux-gnu-nm -u $f; done | awk '{print $2}' | sort -u > /tmp/needs.txt
-comm -23 /tmp/needs.txt /tmp/dev_exports.txt    # 应输出空
 ```
 
-本项目实测两次都是 **0 缺失**。
+```bash
+# ② 导入符号的 CRC 与设备权威表逐个一致（需要 .github/symvers/device-*.symvers）
+python3 ../../.github/scripts/check-symvers.py \
+  ../../.github/symvers/device-6.6.118.symvers *.ko
+```
+
+**② 才是决定能否加载的那一关。** 内核在 `insmod` 时是**逐符号比对 CRC** 的，
+只要一个不符就 `disagrees about version of symbol xxx` 并拒绝加载。
+
+旧版这里用 `grep __ksymtab_` 只检查「符号存在」，**查不出 CRC 不符**，
+已废弃——那次就是因此漏掉了 `module_layout` 不匹配。
+
+> 设备符号表怎么来的、CRC 为什么会不一致、换内核要怎么做，
+> 全部流程见 **[KERNEL-ADAPTATION.md](KERNEL-ADAPTATION.md)**。
 
 ---
 
@@ -243,7 +259,33 @@ lkm 最后 —— 容器在跑时 lkm 会 `Try again`，需要先停容器）。
 
 ---
 
-## 7. 2026-11-03 实测记录
+## 7. 实测记录
+
+### 2026-11-04（GitHub Actions + 设备权威 CRC，当前基线）
+
+| 项 | 结果 |
+|---|---|
+| 6 个 ko 编译 | ✅ 全部成功 |
+| 逐符号 CRC 比对 | ✅ 645/645 与设备一致 |
+| `insmod` 6 个 | ✅ 全部 rc=0 |
+| 布局自校验 | ✅ 60+ 项 `live == build` |
+| hook | ✅ 6 个全部 `installed` |
+| userns | ⚠️ 见下 |
+
+关键修复：CI 装 `pahole` 后 `CONFIG_DEBUG_INFO_BTF_MODULES` 不再被
+`olddefconfig` 静默关闭，`module_layout` CRC 从 `0x6500052f` 自动变成设备要的
+`0x4e276f37`，**全部导入符号自动对齐，无需手改任何一个**。
+
+userns 此前报 `-EINVAL`，根因**不是**「内核未编译」，
+而是 `is_text()` 拿 8 字节对齐去校验 4 字节对齐的 arm64 函数入口
+（`mntns_owner=...f53c`）。已在 `userns_owner.c` 修正为按指令宽度判，
+详见 [KERNEL-ADAPTATION.md §8](KERNEL-ADAPTATION.md)。
+
+> `CONFIG_USER_NS is not set` 仍然成立——模块的 fake userns 本来就是用来
+> 替代内核功能的。修好对齐后 `mntns_operations` 能正常解析，
+> 这条路径才真正可用。
+
+### 2026-11-03（本地 DDK）
 
 | 项 | 结果 |
 |---|---|
@@ -257,7 +299,7 @@ lkm 最后 —— 容器在跑时 lkm 会 `Try again`，需要先停容器）。
 | pids 显示层 | ✅ `cgroup.controllers` / `/proc/cgroups` 有 pids |
 | macvlan | ✅ `ip link add type macvlan` rc=0 |
 | ip6tables nat | ✅ 表可列 |
-| userns | ❌ `-EINVAL`（内核未编译，预期内） |
+| userns | ❌ `-EINVAL`（当时误判为「内核未编译」，实为对齐 bug） |
 
 ---
 

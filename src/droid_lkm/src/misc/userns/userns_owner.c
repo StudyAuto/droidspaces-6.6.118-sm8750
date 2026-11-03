@@ -69,10 +69,23 @@ static const struct proc_ns_operations *droid_lkm_userns_mnt_ops;
 static droid_lkm_userns_owner_t droid_lkm_userns_mnt_owner;
 static unsigned int droid_lkm_userns_mnt_off;
 
+/*
+ * 指针型回调必须落在内核 text 窗口内，且看起来像个函数入口。
+ *
+ * ⚠️ 对齐必须按 **指令** 宽度（4 字节）判，不能按指针宽度（8 字节）。
+ * AArch64 指令固定 4 字节，编译器只保证函数 4 字节对齐：
+ * 设备实测 mntns_get=...f304、mntns_owner=...f53c，两者都不是 8 的倍数。
+ * 早先这里写的是 `!(addr & (sizeof(void *) - 1))`，在 arm64 上把
+ * mntns_owner 判成非法地址，mntns_ops_resolve() 返回 -EINVAL，
+ * 进而 userns 整体降级为 unsupported（dmesg: "mntns_operations unusable: -22"）。
+ * x86_64 的函数入口只会更对齐，用 4 字节判不会误杀。
+ */
+#define DROID_LKM_USERNS_FUNC_ALIGN 4UL
+
 static bool droid_lkm_userns_is_text(unsigned long addr)
 {
 	return addr >= kernel_base && addr - kernel_base < DROID_LKM_USERNS_TEXT_WIN &&
-	       !(addr & (sizeof(void *) - 1));
+	       !(addr & (DROID_LKM_USERNS_FUNC_ALIGN - 1));
 }
 
 /*

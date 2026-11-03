@@ -17,6 +17,8 @@
 | 每次开机容器白失败一次 | [⑦ 开机自启冲突](#七每次开机容器白失败一次) |
 | 状态页显示自相矛盾 | [⑧ 状态页打架](#八状态页自相矛盾) |
 | 想知道到底有没有 userns | [⑨ 判定 userns](#九如何正确判定-userns) |
+| `insmod` 报 `disagrees about version of symbol` | [⑩ 符号 CRC 不匹配](#十符号-crc-不匹配) |
+| `insmod` 报 `Unknown symbol xxx` | [⑩ 符号 CRC 不匹配](#十符号-crc-不匹配) |
 
 ---
 
@@ -366,6 +368,68 @@ su -c 'echo 1 > /sys/module/droid_lkm_misc/parameters/release
 | `unshare -U` 返回 0 | 模块可能"假成功"（剥掉了 flag） |
 
 **只有「模块不在时调 syscall 看 errno」是真的。**
+
+> ⚠️ 别把「模块侧报 `-22`」和「内核有没有 CONFIG_USER_NS」混为一谈。
+> `dmesg` 里 `mntns_operations unusable: -22` / `userns unavailable: -22`
+> 是**模块自己**在初始化时校验失败，与内核配置无关。
+> 2026-11-04 就踩过：真因是 `is_text()` 用 8 字节对齐校验 4 字节对齐的
+> arm64 函数入口，`mntns_owner=...f53c` 被判非法。
+> 详见 [KERNEL-ADAPTATION.md §8](KERNEL-ADAPTATION.md)。
+
+---
+
+## ⑩ 符号 CRC 不匹配
+
+**特征**（`dmesg` 里紧跟着 `insmod: Exec format error`）：
+
+```text
+disagrees about version of symbol module_layout
+disagrees about version of symbol seq_printf
+```
+
+或：
+
+```text
+Unknown symbol filp_open (err -2)
+```
+
+### 两类完全不同的原因
+
+| 报错 | 含义 | 处理 |
+|---|---|---|
+| `disagrees about version` | **CRC 不符**——符号存在，但类型签名不同 | 见下 |
+| `Unknown symbol (err -2)` | 符号**根本没导出** | 只能走 inline hook 或自解析，改 CRC 无用 |
+
+### CRC 不符的两大根因
+
+1. **`CONFIG_DEBUG_INFO_BTF_MODULES` 被静默关掉**
+   最常见。CI 缺 `pahole` 时 `olddefconfig` 会自动关闭它，
+   导致 `struct module` 少 `btf_data`/`btf_data_size`，中间字段位移 48 字节。
+   **`sizeof` 不变**（末尾有 `android_kabi_reserved` 垫着），所以看大小发现不了。
+   → 装 `pahole`，并在 `olddefconfig` 后硬断言该项为 `y`。
+
+2. **源码树不是设备内核的那个 commit**
+   设备是第三方 fork（`899dc6830d9c` 不在上游仓库），
+   头文件声明文本漂移会让 genksyms 算出不同 CRC。
+   → 用从 boot 镜像提取的**设备权威符号表**兜底。
+
+### 一分钟定位
+
+```sh
+# 1) 设备期望值
+grep -P '\tmodule_layout\t' .github/symvers/device-*.symvers
+
+# 2) 我们产物里的值
+python3 .github/scripts/check-symvers.py .github/symvers/device-*.symvers src/dsm/ko/*.ko
+```
+
+- **只差 `module_layout`** → 几乎肯定是 BTF 被关
+- **差一大片（几十上百个）** → 源码树/配置整体不匹配，先查 `LOCALVERSION` 与分支
+
+### 完整方法论
+
+取符号表、交叉验证、合并、出货闸门，全部步骤见
+**[KERNEL-ADAPTATION.md](KERNEL-ADAPTATION.md)**。
 
 ---
 
