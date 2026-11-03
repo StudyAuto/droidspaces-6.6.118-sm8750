@@ -4,9 +4,25 @@
 > 内核：`6.6.118-android15-8-g899dc6830d9c-abogki500782043-lotus-4k`
 > 系统：`PJZ110_16.0.10.501(CN01)` / Android 16
 > 槽位：`_a`
-> 记录时间：2026-11-03
+> 记录时间：2026-11-04（模块加载 / 符号 CRC / userns 已更新）
 
 本文记录的是**这台机器上跑出来的真实结果**，不是设计意图。
+
+---
+
+## 〇、构建基准（2026-11-04）
+
+| 项 | 值 |
+|---|---|
+| 编译来源 | GitHub Actions，真实 6.6.118 源码树 |
+| 符号基准 | 设备权威表 `device-6.6.118.symvers`（9116 条） |
+| `module_layout` CRC | `0x4e276f37`（本地产物与设备**原生一致**） |
+| 逐符号比对 | **645/645** 全部一致 |
+| 交叉验证 | `boot_stats.ko` 11/11、`bam_dma.ko` 84/84 |
+
+> 早期用 DDK 6.6.127 编的产物 CRC 大面积不符（203 个里 97 个），
+> 靠「vermagic 首段被跳过」蒙混——那不是兼容，是没校验。
+> 详见 [docs/KERNEL-ADAPTATION.md](docs/KERNEL-ADAPTATION.md)。
 
 ---
 
@@ -35,13 +51,18 @@ droid_lkm        684032 1 - Live (O)
 |---|---|---|
 | `droid_lkm` | ✅ | `layout: ... ok live=784 build=784`、`ready` |
 | `droid_lkm_vendor` | ✅ | `BTF 10/10 fields live`、`ghost: find_task_by_vpid hooked, match=oplus_` |
-| `droid_lkm_misc` | ✅ | `devtmpfs: registered only (hook off)`、`userns unavailable: -22` |
+| `droid_lkm_misc` | ✅ | `devtmpfs: registered only (hook off)`、`userns hooks installed`、`userns ready` |
 | `droid_lkm_pids` | ✅ | `layout verified: controllers=7`、`pids limit enforcement active` |
 | `macvlan` | ✅ | `[macvlan-shim] self-resolved 7/7 symbols` |
 | `ip6table_nat` | ✅ | 自解析成功（无回退日志） |
 
 **布局自校验全部通过**：`droid_lkm` 输出 20 项 `live == build`，
-说明用 6.6.127 头文件编出来的结构体偏移在 6.6.118 上完全一致。
+`droid_lkm_misc` 输出 60+ 项全部 `ok`（`live == build`）。
+
+> 2026-11-03 时这里写的是「用 6.6.127 头文件编出来的结构体偏移在 6.6.118
+> 上完全一致」——这个结论**已被推翻**。布局看似一致不代表 CRC 一致，
+> 而且 `__versions` 为空时内核根本不校验。详见
+> [docs/KERNEL-ADAPTATION.md](docs/KERNEL-ADAPTATION.md)。
 
 ---
 
@@ -194,33 +215,61 @@ sh /data/adb/modules/Droidspaces-6.6/tools/setup-docker.sh         # 全套：�
 
 ---
 
-## 六、user namespace（结案：不可用）
+## 六、user namespace（模块侧 ready，隔离待容器实测）
+
+### 内核侧的事实（不会变）
 
 | # | 观测 | 命令 |
 |---|---|---|
 | 1 | `# CONFIG_USER_NS is not set` | `zcat /proc/config.gz \| grep USER_NS` |
 | 2 | `/proc/self/ns/` 里没有 `user` | `ls /proc/self/ns/` |
 | 3 | `/proc/self/uid_map` 不存在 | `cat /proc/self/uid_map` → No such file |
-| 4 | `droid_lkm_misc` 日志 `userns unavailable: -22` | `dmesg \| grep userns` |
 
-模块里 `-22` 是 `-EINVAL`，对应内核 `#ifndef CONFIG_USER_NS return -EINVAL`。
+内核没编 `CONFIG_USER_NS`，`unshare(CLONE_NEWUSER)` 在内核里直接返回 `-EINVAL`。
+模块无法改变这一点，只能自建一套 fake userns 兜底。
 
 **`/proc/sys/user/max_user_namespaces` 有值不代表支持 userns**，别拿它当证据。
 
-### WebUI 的「容器独立 uid」开关
-
-开关**默认禁用**，是否可用由模块判定，不由页面自己猜：
+### 模块侧：2026-11-04 修复后 ready
 
 ```sh
 $ grep '^userns ' /proc/droid_lkm_misc/status
-userns                   unsupported    owner symbols missing
+userns                   ready          unshare clone namespace entry credential swap
+userns view              armed          18 armed 0 missing real=0
+userns id map files      ready          uid_map gid_map setgroups under /proc/<pid>
 ```
 
-| 模块状态 | 含义 | 开关 |
+> ⚠️ **2026-11-03 的旧结论「结案：不可用」是错的。**
+> 当时的证据是 `dmesg` 里的 `userns unavailable: -22`，被误读成
+> 「内核没编 `CONFIG_USER_NS`」。真实原因是模块自己的 bug：
+> `is_text()` 用 8 字节对齐校验 arm64 的 4 字节对齐函数入口
+> （`mntns_owner=...f53c`），`mntns_operations` 被判非法 → 整个 userns
+> 初始化失败。修正为按指令宽度判后即可正常初始化。
+> 详见 [docs/KERNEL-ADAPTATION.md](docs/KERNEL-ADAPTATION.md) §8。
+
+### 状态语义
+
+| 模块状态 | 含义 | WebUI 开关 |
 |---|---|---|
-| `ready` | 模块确认能造出 user namespace | ✅ 启用 |
-| `unsupported` | 内核不具备（缺符号 / 挂接失败） | ❌ 禁用 + 显示原因 |
+| `ready` | 模块的 fake userns 路径已就绪 | ✅ 启用 |
+| `unsupported` | 符号解析或挂接失败 | ❌ 禁用 + 显示原因 |
 | `off` | 加载时传了 `userns=0` | ❌ 禁用 |
+
+> **`ready` 只表示模块侧路径打通，不等于「容器 root 与宿主 root 已隔离」。**
+> fake userns 不是内核 userns，隔离效果需容器侧单独验证。
+
+### 关于 selftest 的 `-22`
+
+```sh
+$ grep '^userns selftest' /proc/droid_lkm_misc/status
+userns selftest          failed         1 failed: unshare(CLONE_NEWUSER) (-22)
+```
+
+这是**策略默认值**，不是故障：自检进程名 `dlm_userns_prob` 既不「已在
+namespace 内」也不「从 root 启动」，而 `userns_any` 默认关闭。
+dmesg 会写明 `refused, userns_any is off`。
+想跑通完整自检需 `insmod droid_lkm_misc.ko userns_any=1`
+（`droid_lkm` 被 proc ns hook 永久 pin，改参数只能重启后重载）。
 
 > **注意宿主和容器的 `/proc/config.gz` 不是同一份：**
 >

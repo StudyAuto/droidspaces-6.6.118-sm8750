@@ -6,6 +6,64 @@
 
 ---
 
+## 未发布 — 2026-11-04
+
+**构建基准重构：改用设备权威符号 CRC，6 个模块全部可加载。**
+
+### 修复（关键）
+
+- **`module_layout` CRC 不匹配，所有模块 `insmod` 失败**
+  - 现象：`disagrees about version of symbol module_layout`，设备期望
+    `0x4e276f37`，本地产物 `0x6500052f`
+  - 根因一：CI 缺 `pahole`，`olddefconfig` **静默关闭**了
+    `CONFIG_DEBUG_INFO_BTF_MODULES`。设备内核有该项，`struct module` 因此含
+    `btf_data`/`btf_data_size`；少了这两个字段，中间成员整体位移 **48 字节**。
+    因为末尾有 `android_kabi_reserved1..4` 垫着，**`sizeof` 完全不变**，
+    只看大小发现不了
+  - 根因二：设备内核是第三方基于官方源码的 fork（commit `899dc6830d9c`
+    不在上游仓库），头文件声明文本漂移会让 `genksyms` 算出不同 CRC
+  - 修法：CI 装 `pahole` 并在 `olddefconfig` 后硬断言 BTF 两项为 `y`；
+    固件侧改用**设备权威符号表**兜底
+- **新增设备权威符号表提取流程**（`.github/symvers/device-6.6.118.symvers`，9116 条）
+  - 直接从 `boot_a` 镜像解析 `__ksymtab` / `__ksymtab_gpl` / `__kcrctab`，
+    **不在设备上运行任何内核代码**
+  - 交叉验证：用设备真实 vendor 模块的 `__versions` 反查，
+    `boot_stats.ko` 11/11、`bam_dma.ko` 84/84 全中
+  - 上机实测：**645/645 导入符号 CRC 全部一致，6 个模块 `insmod` 全通**
+- **userns 在 arm64 上被误判为不可用**
+  - 现象：`mntns_operations unusable: -22`、`userns unavailable: -22`，
+    `/proc/droid_lkm_misc/status` 显示 `userns unsupported`
+  - 根因：`userns_owner.c` 的 `is_text()` 用 `sizeof(void *) - 1`（8 字节）
+    校验函数入口对齐，但 **AArch64 指令固定 4 字节**，编译器只保证 4 字节对齐
+    （`mntns_owner=...f53c`）→ 被判非法 → 整个 userns 初始化失败
+  - 修法：改按指令宽度判（`DROID_LKM_USERNS_FUNC_ALIGN 4UL`）
+  - 上机实测：`userns ready`，18 个 view 探针 armed、0 missing
+
+### 订正（推翻旧结论）
+
+- **「用 DDK 6.6.127 编的模块能进 6.6.118」是错的**
+  旧文档称内核 `same_magic()` 在 `has_crcs` 时跳过 vermagic 首段，因此小版本
+  不同也能加载。实际：`__versions` 段存在且**大小为 0 也算存在**，
+  此时内核跳过 CRC 比对——那不是「兼容」，而是**没校验**。
+  布局不匹配照样运行时崩溃。正确做法是让 CRC 真正对齐。
+- **userns 的 `-22` 不是「内核没编 `CONFIG_USER_NS`」**
+  该配置确实未开，但模块的 fake userns 本就是替代方案。真正的失败在
+  模块自己的对齐假设（见上）。`CONFIG_USER_NS is not set` 与 `userns ready`
+  可以同时成立。
+
+### 文档
+
+- 新增 **`docs/KERNEL-ADAPTATION.md`**：换内核 / 换机型 / 重编译的完整方法论
+  （取符号表、pahole/BTF 坑、合并策略、出货闸门、排查表，
+  以及明确记录「不要在设备上跑探针导符号表」的三次失败）
+- `docs/BUILD.md`：自检改用 `check-symvers.py`（旧版只查符号存在，
+  **查不出 CRC 不符**，正是上次漏掉 `module_layout` 的原因）
+- `docs/TROUBLESHOOTING.md`：新增 ⑩ 符号 CRC 不匹配；订正 ⑨ 中把
+  「模块侧 `-22`」误当「内核没有 `CONFIG_USER_NS`」的说法
+- `README.md` / `docs/en/README.md`：版本号、构建路线、符号 CRC 章节全面重写
+
+---
+
 ## v1.0.1-6.6 — 2026-11-03
 
 **安全修复：`/proc/config.gz` 伪装会导致 system_server 崩溃、整机重启。**

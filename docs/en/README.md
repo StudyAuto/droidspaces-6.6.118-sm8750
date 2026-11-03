@@ -1,20 +1,23 @@
-> English version of [README.md](../../README.md). Droidspaces 6.6 — v1.0.0-6.6 (author: ai-luo).
+> English version of [README.md](../../README.md). Droidspaces 6.6 — v1.0.1-6.6 (author: ai-luo).
 
 # Droidspaces Kernel Module Suite (OnePlus 13 / OP5D0DL1 / Android 16 / 6.6.118)
 
 Six LKM kernel modules loaded via KernelSU, plus full source code and the complete build / deploy / verify procedure.
 
-Current version **v1.0.0-6.6** (`dsm/module.prop`, shown directly at the right of the WebUI title), author `ai-luo`.
+Current version **v1.0.1-6.6** (`dsm/module.prop`, shown directly at the right of the WebUI title), author `ai-luo`.
 The documentation comes in two languages: the root directory holds the Chinese version, and [`./`](./) (i.e. `docs/en/`) holds the matching English version.
 
 Goal: **without flashing a kernel**, backfill the options missing for Docker / container runtimes on the
 stock GKI kernel — `CONFIG_PID_NS` / `CONFIG_IPC_NS` / `CONFIG_SYSVIPC` / `CONFIG_POSIX_MQUEUE` /
 `CONFIG_DEVTMPFS` — and additionally provide macvlan and IPv6 NAT.
 
-> **On `CONFIG_USER_NS`**: this one **cannot** be backfilled. The stock kernel was built without it
-> (`unshare -U true` returns EINVAL, `/proc/<pid>/ns/user` does not exist). The module only performs
-> id translation at syscall boundaries, which is **not isolation** — container root is host root.
-> See the evidence chain at the end of [`CHANGELOG.md`](../../CHANGELOG.md).
+> **On `CONFIG_USER_NS`**: the stock kernel was built without it, so the kernel itself cannot create a
+> user namespace (`unshare -U true` returns EINVAL, `/proc/<pid>/ns/user` does not exist).
+> `droid_lkm_misc.ko` provides its **own** fake userns plus a syscall-boundary id translation layer.
+> This is **not** equivalent to a kernel user namespace, and the isolation it actually delivers has
+> **not** been fully verified in containers yet — do not treat container root as isolated from host root.
+> Check the module-side state with `grep '^userns ' /proc/droid_lkm_misc/status`
+> (`ready` = module path works; it does not by itself prove isolation).
 
 ---
 
@@ -24,10 +27,14 @@ stock GKI kernel — `CONFIG_PID_NS` / `CONFIG_IPC_NS` / `CONFIG_SYSVIPC` / `CON
 | --- | --- | --- |
 | `droid_lkm.ko` | PID/IPC namespace, System V IPC, POSIX mqueue | ✅ loads successfully |
 | `droid_lkm_vendor.ko` | oplus vendor compatibility (fingerprint / parameter fixes) | ✅ loads successfully |
-| `droid_lkm_misc.ko` | devtmpfs (hardware access works); user-namespace view (**inactive: kernel built without `CONFIG_USER_NS`**) | ✅ loads successfully |
+| `droid_lkm_misc.ko` | devtmpfs; module-side fake userns + id translation | ✅ loads, `userns ready` (18 view probes armed, 0 missing) |
 | `droid_lkm_pids.ko` | `pids` controller: display layer (check item turns green) + **enforcement layer** (`--pids-limit` really blocks fork), can be unloaded on its own | ✅ verified on a real device (all 40 DS checks green, `refused` > 0) |
 | `macvlan.ko` | dedicated LAN IP for containers (`docker run --net=macvlan`) | ⚠ control plane usable, data plane limited by WiFi |
 | `ip6table_nat.ko` | IPv6 NAT (IPv6 for `docker run --net=nat`) | ✅ loads successfully, rules can be added and removed |
+
+Build/symbol baseline (2026-11-04): built by GitHub Actions from the real 6.6.118 tree,
+**645/645 imported symbols CRC-matched** against the device's authoritative symbol table
+extracted from the `boot_a` image. See [`../KERNEL-ADAPTATION.md`](../KERNEL-ADAPTATION.md).
 
 Tested combination (the **only verified combination**):
 
@@ -47,7 +54,18 @@ Tested combination (the **only verified combination**):
 ├── USAGE.md                   usage and troubleshooting (WebUI / Docker / recovery)
 ├── LICENSE                    GPL-2.0 (code of this project)
 ├── THIRD-PARTY.md             third-party source attribution and licenses
+├── .github/
+│   ├── workflows/
+│   │   └── build-lkm-6.6.118.yml   primary build (GitHub Actions)
+│   ├── kconfig/
+│   │   └── device-6.6.118.config   snapshot of the device /proc/config.gz
+│   ├── symvers/
+│   │   └── device-6.6.118.symvers  authoritative device symbol table (9116 CRC entries)
+│   └── scripts/
+│       ├── merge-symvers.py        merge device table (device wins on conflict)
+│       └── check-symvers.py        release gate: per-symbol CRC comparison
 ├── docs/
+│   ├── KERNEL-ADAPTATION.md   ★ REQUIRED READING for a new kernel / new device / rebuild
 │   ├── PRINCIPLE.md           implementation principles (what each module actually does)
 │   ├── PIDS-ENFORCEMENT.md    pids enforcement layer: how `pids.max` is built, how fork is blocked
 │   ├── BUILD-FOR-OTHERS.md    building for someone else's phone (porting procedure)
@@ -128,6 +146,12 @@ A different device or a different kernel requires a rebuild. The full porting pr
 [`BUILD-FOR-OTHERS.md`](BUILD-FOR-OTHERS.md). The one-liner version:
 
 ```bash
+# Primary path: GitHub Actions (also the way to rebuild after a kernel change)
+git push        # triggers .github/workflows/build-lkm-6.6.118.yml
+#   real 6.6.118 source -> kernel with the device config -> merge device symvers
+#   -> build 6 modules -> per-symbol CRC gate -> upload artifacts
+
+# Fallback: local DDK, when Actions is unavailable
 # Use the DDK target matching the GKI version of the other party's kernel
 sh scripts/build-ddkk.sh    android15-6.6     # e.g.: 6.6 kernel
 sh scripts/build-net-ddk.sh android15-6.6
@@ -136,8 +160,26 @@ sh scripts/package-ksu-zip.sh
 su -c 'echo "<target device codename>" >> /data/adb/modules/Droidspaces/allow_list'
 ```
 
-**Key constraint**: the clang version must match the one used to build the target kernel (KCFI).
-A module built with the system clang 18 will shut the phone down the moment you `insmod` it. You must use the DDK image.
+**Two hard constraints, both must hold or `insmod` fails:**
+
+1. **clang must match the target kernel** (KCFI). A module built with the system clang 18 will shut
+   the phone down the moment you `insmod` it. Use the matching DDK clang r510928.
+2. **Every imported symbol's CRC must match the device kernel.** The kernel compares CRC per symbol at
+   `insmod`; one mismatch yields `disagrees about version of symbol xxx`. CRC is computed by `genksyms`
+   from header declaration text plus config, so a source tree that is not the device's commit cannot
+   reproduce it. Always gate the build:
+
+```bash
+python3 .github/scripts/check-symvers.py \
+  .github/symvers/device-<version>.symvers src/dsm/ko/*.ko
+```
+
+**`pahole` is mandatory on the build host.** Without it `olddefconfig` silently disables
+`CONFIG_DEBUG_INFO_BTF_MODULES`, `struct module` loses `btf_data`/`btf_data_size`, its middle fields
+shift by 48 bytes (`sizeof` stays the same, so it is very hard to spot), and `module_layout` CRC is wrong.
+
+> Full procedure, pitfalls and troubleshooting table:
+> [`../KERNEL-ADAPTATION.md`](../KERNEL-ADAPTATION.md).
 
 ---
 
@@ -229,6 +271,29 @@ Rescue order: KernelSU safe mode (hold volume down while booting) → or delete 
   Using it for real requires a USB wired Ethernet adapter. macvlan is **not needed** in host network mode.
 - **KCFI is strict**: any rebuild must use the matching DDK clang r510928; a module built with the system
   clang 18 will shut the phone down on `insmod`.
+- **No real kernel user namespace**: `CONFIG_USER_NS` is not compiled into the device kernel.
+  `droid_lkm_misc.ko` supplies its own fake userns plus a syscall-boundary id translation layer
+  (module state `userns ready`, 18 view probes armed). This is **not** equivalent to a kernel
+  user namespace; do not assume container root is isolated from host root until container-side
+  isolation has been fully verified.
+
+---
+
+## 7. Rebuilding / porting to another kernel
+
+**Read [`../KERNEL-ADAPTATION.md`](../KERNEL-ADAPTATION.md) first.**
+
+In one line: whether the modules load depends **entirely** on symbol CRC matching the device kernel.
+
+Four steps, in order, none skippable:
+
+1. **Capture the device config** — `zcat /proc/config.gz`, then `tr -d '\r'`
+2. **Extract the authoritative symbol table** — parse it out of the `boot_a` image;
+   never run in-kernel probe code on the device
+3. **Cross-validate** — check it against 2 real vendor modules' `__versions`; must be 100% hits
+4. **Build kernel + merge symvers + pass the gate**
+
+Prerequisite: `pahole` must be installed on the build host.
 
 ---
 
