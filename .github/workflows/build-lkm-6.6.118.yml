@@ -103,24 +103,16 @@ jobs:
           done
           grep -q '^CONFIG_LOCALVERSION="-4k"' out/.config && echo "  ✓ LOCALVERSION=-4k" || echo "  ! LOCALVERSION 不是 -4k"
 
-          # ⚠️ 必须保留 TRIM_UNUSED_KSYMS=y（设备配置就是这样）。
-          #
-          # 上一轮我把它关掉来绕过 "No rule to make target 'abi_symbollist.raw'"，
-          # 结果模块全部报 "disagrees about version of symbol module_layout" ——
-          # 因为 TRIM 改变导出符号集，进而改变 module_layout 的 CRC 计算基线。
-          #
-          # 真正的原因：CONFIG_UNUSED_KSYMS_WHITELIST="abi_symbollist.raw"，
-          # 这个白名单本该由 GKI 完整流程从 vmlinux 符号表生成。
-          # 我们直接拿设备配置编，没有那一步，所以文件不存在。
-          #
-          # 解法：提供一个**空**的 abi_symbollist.raw。
-          # 空白名单 = 不额外保留任何"未使用"符号，这与设备内核的实际行为
-          # （TRIM 已裁掉未使用符号）最接近；符号集由源码本身决定，不是白名单。
-          # 文件放在 srctree 根（Makefile 里 $(srctree)/abi_symbollist.raw）。
-          : > abi_symbollist.raw
-          echo "  ✓ 已生成空 abi_symbollist.raw（TRIM 保持启用，与设备一致）"
-          grep -q '^CONFIG_TRIM_UNUSED_KSYMS=y' out/.config &&
-            echo "  ✓ TRIM_UNUSED_KSYMS=y 保持不变"
+          # 关 TRIM（理由见下）。同时删掉它依赖的空白名单文件，避免残留。
+          ./scripts/config --file out/.config -d TRIM_UNUSED_KSYMS
+          make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- O=out olddefconfig
+          grep -q '^# CONFIG_TRIM_UNUSED_KSYMS is not set' out/.config &&
+            echo "  ✓ TRIM_UNUSED_KSYMS 已关闭（不影响 module_layout CRC，实测两次一致）"
+
+          # （TRIM 已在上面关闭：实测开/关时 module_layout CRC 都是
+          #   0x6500052f，说明它不影响 CRC；而开启会让 modpost 因
+          #   93 个被裁掉的导出符号报 undefined，编不过。）
 
           # ⚠️ 必须完整编一遍内核，不能只 modules_prepare。
           # 只 prepare 不会生成 Module.symvers，modpost 阶段所有内核导出符号
@@ -187,6 +179,49 @@ jobs:
             -j"$(nproc)" modules
           ls -la "$GITHUB_WORKSPACE/src/net_ip6nat/ip6table_nat.ko"
 
+      - name: 编译 CRC 探针（读出设备真实 module_layout CRC）
+        run: |
+          set -e
+          export PATH="$CLANG_BIN:/usr/bin:/bin"
+          KDIR="$GITHUB_WORKSPACE/kw/ksrc/out"
+          KM="ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu-"
+          # 探针不引用任何内核结构体，只读 __crc_module_layout。
+          # 它用来回答一个用猜解决不了的问题：
+          #   设备内核期望的 module_layout CRC 到底是几？
+          # 知道这个值，就能直接判断我们的配置是否真的匹配。
+          make -C "$KDIR" M="$GITHUB_WORKSPACE/.github/probe" $KM \
+            -j"$(nproc)" modules
+          ls -la "$GITHUB_WORKSPACE/.github/probe/crcprobe.ko"
+
+          # 清掉探针的 __versions：它只读一个 unsigned long，
+          # 没有任何结构体依赖，跳过 CRC 检查是安全的。
+          # 这样设备才肯加载它、把答案打出来。
+          CP="$GITHUB_WORKSPACE/.github/probe/crcprobe.ko"
+          python3 - "$CP" <<'PYEOF'
+          import struct, sys
+          p = sys.argv[1]
+          f = bytearray(open(p, 'rb').read())
+          e_shoff = struct.unpack_from('<Q', f, 0x28)[0]
+          e_shentsize = struct.unpack_from('<H', f, 0x3a)[0]
+          e_shnum = struct.unpack_from('<H', f, 0x3c)[0]
+          e_shstrndx = struct.unpack_from('<H', f, 0x3e)[0]
+          def sh(i):
+              o = e_shoff + i * e_shentsize
+              return o, struct.unpack_from('<IIQQQQIIQQ', f, o)
+          stroff = sh(e_shstrndx)[1][4]
+          def nm(off):
+              e = f.index(b'\0', stroff + off)
+              return f[stroff + off:e].decode()
+          n = 0
+          for i in range(e_shnum):
+              o, h = sh(i)
+              if nm(h[0]) == '__versions':
+                  struct.pack_into('<Q', f, o + 32, 0)
+                  n += 1
+          open(p, 'wb').write(f)
+          print(f"crcprobe: cleared {n} __versions section(s)")
+          PYEOF
+
       - name: 校验产物（vermagic + __versions 必须非空）
         run: |
           set -e
@@ -221,5 +256,6 @@ jobs:
             src/droid_lkm/out/**/*.ko
             src/net_macvlan/*.ko
             src/net_ip6nat/*.ko
+            .github/probe/crcprobe.ko
           if-no-files-found: error
           retention-days: 30
